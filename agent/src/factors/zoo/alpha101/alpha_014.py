@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #14
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第14号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #14.
 
 Formula (paper appendix): (-1*rank(delta(returns,3))) * correlation(open, volume, 10)
@@ -37,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['open', 'close', 'volume'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 10,
@@ -51,7 +57,7 @@ def compute(panel: dict) -> pd.DataFrame:
     open_ = panel["open"]
     volume = panel["volume"]
 
-    returns = close.pct_change()
+    returns = close.pct_change(fill_method=None)
     # Helper aliases (local closures keep the file standalone & purity-safe).
     out = (-1.0 * rank(delta(returns, 3))) * ts_corr(open_, volume, 10)
     return out

@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #128
+# 简要说明: 国泰君安191短周期交易型alpha因子第128号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha 128 (国泰君安 191 短周期交易型 alpha 因子, 2014).
 
 Formula (verbatim from the report):
@@ -59,8 +65,11 @@ def compute(panel):
     v = panel["volume"]
     tp = (h + l + c) / 3.0
     dtp = tp - tp.shift(1)
-    up = (tp * v).where(dtp > 0, 0.0).rolling(14).sum()
-    down = (tp * v).where(dtp < 0, 0.0).rolling(14).sum()
+    flow = tp * v
+    # A missing price change or money flow is neither inflow nor outflow (#1463).
+    valid = dtp.notna() & flow.notna()
+    up = flow.where(dtp > 0, 0.0).where(valid).rolling(14).sum()
+    down = flow.where(dtp < 0, 0.0).where(valid).rolling(14).sum()
     ratio = safe_div(up, down)
     out = 100.0 - 100.0 / (1.0 + ratio)
     return out

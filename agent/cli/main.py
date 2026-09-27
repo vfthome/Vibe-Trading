@@ -2,8 +2,8 @@
 
 Responsibilities:
 
-1. Detect whether ``~/.vibe-trading/.env`` exists; if missing, run the
-   onboarding wizard (:mod:`cli.onboard`) before doing anything else.
+1. Detect whether any provider `.env` candidate exists; if all are missing, run
+   the onboarding wizard (:mod:`cli.onboard`) before doing anything else.
 2. Render the startup banner (:mod:`cli.intro`) on interactive entry.
 3. For interactive entry (no subcommand, or ``chat``) drive the REPL
    built on :mod:`cli.input`, :mod:`cli.completer`,
@@ -20,10 +20,11 @@ hits :func:`main`.
 from __future__ import annotations
 
 import importlib
-import os
+import logging
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -83,8 +84,23 @@ def _register_live_slash_commands() -> None:
 
 
 _register_live_slash_commands()
-
+# QVERIS-INTEGRATION
+def _register_data_slash_commands() -> None:  # QVERIS-INTEGRATION
+    """Surface data routing mode in the shared slash registry."""  # QVERIS-INTEGRATION
+    from cli.commands import slash_router  # QVERIS-INTEGRATION
+    if any(cmd.name == "data" for cmd in slash_router.SLASH_COMMANDS):  # QVERIS-INTEGRATION
+        return  # QVERIS-INTEGRATION
+    commands = list(slash_router.SLASH_COMMANDS)  # QVERIS-INTEGRATION
+    quit_idx = next((i for i, c in enumerate(commands) if c.name == "quit"), len(commands))  # QVERIS-INTEGRATION
+    commands.insert(quit_idx, slash_router.Command("data", "Data routing mode", "cli.main"))  # QVERIS-INTEGRATION
+    slash_router.SLASH_COMMANDS = tuple(commands)  # QVERIS-INTEGRATION
+# QVERIS-INTEGRATION
+_register_data_slash_commands()  # QVERIS-INTEGRATION
+# QVERIS-INTEGRATION
+_AGENT_DIR = Path(__file__).resolve().parents[1]
 _ENV_PATH = Path.home() / ".vibe-trading" / ".env"
+_PROJECT_ENV_PATH = _AGENT_DIR / ".env"
+_CWD_ENV_PATH = Path.cwd() / ".env"
 # Best-effort fallbacks used only when the probe genuinely fails (missing
 # dependency, broken install). The numbers track the actual bundled counts
 # so a probe failure still shows a plausible banner rather than "0 loaded".
@@ -105,13 +121,20 @@ _SESSION_STORE_CACHE: Any = None
 
 def _probe_model_name() -> str:
     """Return the configured LLM model id, or a placeholder."""
-    name = os.environ.get("LANGCHAIN_MODEL_NAME") or os.environ.get("OPENAI_MODEL")
+    from src.config.accessor import get_env_config
+
+    name = get_env_config().llm.langchain_model_name or get_env_config().llm.openai_model
     if name:
         return name
+    env_path = _first_existing_env_path()
+    if env_path is None:
+        return "unset (use /model to pick one)"
     try:
-        text = _ENV_PATH.read_text(encoding="utf-8")
+        text = env_path.read_text(encoding="utf-8")
         for line in text.splitlines():
             if line.startswith("LANGCHAIN_MODEL_NAME="):
+                return line.split("=", 1)[1].strip()
+            if line.startswith("OPENAI_MODEL="):
                 return line.split("=", 1)[1].strip()
     except OSError:
         pass
@@ -146,7 +169,9 @@ def _probe_skill_count() -> int:
 
 def _probe_session_count() -> int:
     """Count recorded sessions from the SQLite store."""
-    db_path = Path.home() / ".vibe-trading" / "sessions.db"
+    from src.config.paths import get_runtime_root
+
+    db_path = get_runtime_root() / "sessions.db"
     if not db_path.exists():
         return 0
     try:
@@ -244,13 +269,13 @@ def _is_supported_chat_invocation(argv: Sequence[str]) -> bool:
 
 
 def _maybe_run_onboarding() -> bool:
-    """Run the first-launch wizard when ``.env`` is missing.
+    """Run the first-launch wizard when every provider ``.env`` candidate is missing.
 
     Returns:
         ``True`` if startup should proceed, ``False`` if the user cancelled
         the wizard cleanly.
     """
-    if _ENV_PATH.exists():
+    if _first_existing_env_path() is not None:
         return True
     console = get_console()
     written = run_onboarding(console=console)
@@ -264,6 +289,19 @@ def _maybe_run_onboarding() -> bool:
     except Exception:  # noqa: BLE001 — legacy will load again later
         pass
     return True
+
+
+def _env_candidates() -> tuple[Path, ...]:
+    """Return provider `.env` candidates in the same order as ``src.providers.llm``."""
+    return (_ENV_PATH, _PROJECT_ENV_PATH, _CWD_ENV_PATH)
+
+
+def _first_existing_env_path() -> Path | None:
+    """Return the first configured `.env` candidate that exists, if any."""
+    for path in _env_candidates():
+        if path.exists():
+            return path
+    return None
 
 
 def _show_banner() -> None:
@@ -319,6 +357,7 @@ class InteractiveContext:
     last_recap_history_len: int = 0
     pending_prompt: Optional[str] = None
     pending_proposal: Optional[Dict[str, Any]] = None
+    pending_scheduled_proposal: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +366,7 @@ class InteractiveContext:
 
 
 def _session_store() -> Any:
-    """Return a process-wide :class:`SessionStore` rooted at ``agent/sessions``.
+    """Return a process-wide :class:`SessionStore` rooted at the user-level sessions dir.
 
     Cached on the module so repeat ``_append_message`` / ``_new_session``
     calls don't re-import ``src.session.store`` every turn.
@@ -341,12 +380,30 @@ def _session_store() -> Any:
     return _SESSION_STORE_CACHE
 
 
+def _build_session_history(store: Any, session_id: str) -> list[dict]:
+    """Load and filter recent message history for a session.
+
+    Returns up to ``_HISTORY_RETAINED_TURNS`` user/assistant messages
+    with non-empty content.
+    """
+    try:
+        messages = store.get_messages(session_id, limit=_HISTORY_RETAINED_TURNS * 2)
+    except Exception:  # noqa: BLE001 — persistence error → empty history
+        return []
+    history = [
+        {"role": m.role, "content": m.content}
+        for m in messages
+        if m.role in {"user", "assistant"} and m.content.strip()
+    ]
+    return history[-_HISTORY_RETAINED_TURNS:]
+
+
 def _new_session(prompt_preview: str) -> Optional[str]:
     """Create a fresh session record. Returns the id, or None on failure.
 
     Dual-writes to the filesystem :class:`SessionStore` (canonical JSONL
-    log under ``agent/sessions/``) *and* to the SQLite FTS5 search index
-    (``~/.vibe-trading/sessions.db``) so cross-session search via
+    log in the user-level sessions dir) *and* to the SQLite FTS5 search
+    index (``sessions.db`` beside it) so cross-session search via
     :class:`SessionSearchIndex` finds turns recorded from the interactive
     loop. Matches the pattern in :class:`SessionService`.
     """
@@ -418,7 +475,9 @@ def _maybe_resume_last_session(console: Any) -> Optional[Dict[str, Any]]:
 
     Returns:
         A dict ``{"session_id": str, "history": list[dict], "title": str}``
-        when the user opts to resume, otherwise ``None`` (new session).
+        when the user opts to resume, ``{"pending_input": str}`` when the
+        user typed a first chat turn into the prompt, otherwise ``None`` (new
+        session).
     """
     try:
         store = _session_store()
@@ -435,24 +494,18 @@ def _maybe_resume_last_session(console: Any) -> Optional[Dict[str, Any]]:
         f"[dim]Resume last session ({title})? (r)esume / (n)ew (default: new)[/dim]"
     )
     try:
-        choice = input("> ").strip().lower()
+        raw_choice = input("> ").strip()
     except (EOFError, KeyboardInterrupt):
         return None
-    if choice not in {"r", "resume", "y", "yes"}:
+    choice = raw_choice.lower()
+    if choice in {"", "n", "new", "no"}:
         return None
+    if choice not in {"r", "resume", "y", "yes"}:
+        return {"pending_input": raw_choice}
 
-    try:
-        messages = store.get_messages(last.session_id, limit=_HISTORY_RETAINED_TURNS * 2)
-    except Exception:  # noqa: BLE001
-        messages = []
-    history = [
-        {"role": m.role, "content": m.content}
-        for m in messages
-        if m.role in {"user", "assistant"} and m.content.strip()
-    ]
     return {
         "session_id": last.session_id,
-        "history": history[-_HISTORY_RETAINED_TURNS:],
+        "history": _build_session_history(store, last.session_id),
         "title": title,
     }
 
@@ -654,7 +707,10 @@ def _run_one_turn(user_input: str, ctx: InteractiveContext) -> None:
     console = get_console()
 
     if ctx.session_id is None:
-        ctx.session_id = _new_session(user_input)
+        # Fall back to an unpersisted id: a session-store failure must not strip
+        # the turn of its session, which would fail every research-goal call
+        # with ``session_id is required`` (#885).
+        ctx.session_id = _new_session(user_input) or uuid.uuid4().hex[:12]
     _append_message(ctx.session_id or "", "user", user_input)
 
     start = time.perf_counter()
@@ -704,8 +760,12 @@ def _run_one_turn(user_input: str, ctx: InteractiveContext) -> None:
     # numbered choice block isn't clobbered by the live region, and arm the
     # REPL to intercept the next reply (SPEC.md Consent §2).
     if captured_proposal:
-        ctx.pending_proposal = dict(captured_proposal)
-        _render_mandate_proposal(console, ctx.pending_proposal)
+        if captured_proposal.get("type") == "scheduled_research.proposal":
+            ctx.pending_scheduled_proposal = dict(captured_proposal)
+            _render_scheduled_proposal(console, ctx.pending_scheduled_proposal)
+        else:
+            ctx.pending_proposal = dict(captured_proposal)
+            _render_mandate_proposal(console, ctx.pending_proposal)
 
     ctx.history.append({"role": "user", "content": user_input})
     answer = (result.get("content") or "").strip()
@@ -721,15 +781,46 @@ def _print_interactive_result(console: Any, result: Dict[str, Any], elapsed: flo
     """Print the assistant answer after the rail without boxed run panels."""
 
     from cli.ui.transcript import render_answer, render_elapsed_status
+    from cli._legacy import _read_metric_values
 
     content = (result.get("content") or "").strip()
     if content:
         console.print(render_answer(content))
         console.print()
-    console.print(render_elapsed_status(elapsed))
     run_id = result.get("run_id")
-    if run_id:
+    run_dir = result.get("run_dir")
+    metrics = (
+        _read_metric_values(Path(run_dir) / "artifacts" / "metrics.csv") if run_dir else {}
+    )
+    if run_id and metrics:
+        console.print("[bold green]✓ Backtest complete[/bold green]")
+        metric_rows = (
+            ("Total return", "total_return", True),
+            ("Annual return", "annual_return", True),
+            ("Sharpe", "sharpe", False),
+            ("Max drawdown", "max_drawdown", True),
+            ("Win rate", "win_rate", True),
+            ("Trades", "trade_count", False),
+        )
+        for label, key, as_percent in metric_rows:
+            value = metrics.get(key)
+            if value is None:
+                continue
+            rendered = f"{value * 100:.1f}%" if as_percent else (
+                f"{int(value)}" if key == "trade_count" else f"{value:.2f}"
+            )
+            console.print(f"  {label:<14} [bold]{rendered}[/bold]")
+        console.print()
+        console.print(f"[bold]Run ID:[/bold] [cyan]{run_id}[/cyan]")
+        # Name the dashboard without starting a server: this is a print path, and
+        # a process spawned here would outlive the command that created it.
+        console.print(
+            f"[dim]Dashboard: run `vibe-trading serve`, then open "
+            f"/runs/{run_id}?view=dashboard[/dim]"
+        )
+    elif run_id:
         console.print(f"[dim]/show {run_id} · {elapsed:.1f}s[/dim]")
+    console.print(render_elapsed_status(elapsed))
 
 
 def _print_recap_if_needed(console: Any, ctx: InteractiveContext) -> None:
@@ -871,8 +962,20 @@ def _run_connector_command_from_repl(console: Any, args: list[str]) -> None:
         _dispatch_connector(parsed)
     except Exception as exc:  # noqa: BLE001 — never let a connector command kill the loop
         console.print(f"[bold red]/connector failed:[/bold red] {exc}")
-
-
+# QVERIS-INTEGRATION
+def _run_data_command_from_repl(console: Any, args: list[str]) -> None:  # QVERIS-INTEGRATION
+    """Run a ``/data ...`` subcommand from the REPL via the CLI dispatcher."""  # QVERIS-INTEGRATION
+    from cli._legacy import _build_parser, _dispatch_data  # QVERIS-INTEGRATION
+    argv = ["data", *(args or ["status"])]  # QVERIS-INTEGRATION
+    try:  # QVERIS-INTEGRATION
+        parsed = _build_parser().parse_args(argv)  # QVERIS-INTEGRATION
+    except SystemExit:  # QVERIS-INTEGRATION
+        console.print("[dim]Usage: /data [status|mode free|mode paid|usage][/dim]")  # QVERIS-INTEGRATION
+        return  # QVERIS-INTEGRATION
+    try:  # QVERIS-INTEGRATION
+        _dispatch_data(parsed)  # QVERIS-INTEGRATION
+    except Exception as exc:  # noqa: BLE001  # QVERIS-INTEGRATION
+        console.print(f"[bold red]/data failed:[/bold red] {exc}")  # QVERIS-INTEGRATION
 def _is_numeric_pick(text: str) -> Optional[int]:
     """Return the chosen ordinal if ``text`` is a bare numeric pick, else None.
 
@@ -922,6 +1025,7 @@ def _render_mandate_proposal(console: Any, proposal: Dict[str, Any]) -> None:
         )
     console.print()
 
+
     for profile in profiles:
         ordinal = profile.get("ordinal", "?")
         label = profile.get("label", "")
@@ -959,7 +1063,106 @@ def _render_mandate_proposal(console: Any, proposal: Dict[str, Any]) -> None:
     console.print()
 
 
-def _commit_mandate(proposal: Dict[str, Any], selected_ordinal: int) -> Dict[str, Any]:
+def _render_scheduled_proposal(console: Any, proposal: Dict[str, Any]) -> None:
+    """Render the deterministic y/N confirmation block for a scheduled job."""
+    job = proposal.get("job") or {}
+    schedule = job.get("schedule") or {}
+    delivery = job.get("delivery") or {}
+    operation = proposal.get("operation")
+    verb = "创建" if operation == "create" else "取消"
+    channel_suffix = f" ({delivery.get('channel')})" if delivery.get("channel") else ""
+    console.print()
+    console.print(f"[bold orange1]定时研究确认 · {verb}[/bold orange1]")
+    console.print(f"  任务: {job.get('title') or job.get('id') or '?'}")
+    if operation == "create":
+        console.print(
+            f"  节奏: {schedule.get('expression')} · "
+            f"{schedule.get('timezone') or 'UTC'} · 截止 {schedule.get('end_at') or '无'}"
+        )
+        console.print(
+            f"  投递: {delivery.get('target_label') or '仅应用内'}{channel_suffix}"
+        )
+    console.print("[bold]确认执行？ [y/N][/bold]")
+
+
+def _handle_scheduled_proposal_reply(text: str, ctx: InteractiveContext) -> bool:
+    """Commit/discard an outstanding scheduled proposal before the model."""
+    token = text.strip().lower()
+    if token not in {"y", "yes", "确认", "n", "no", "取消", "放弃"}:
+        return False
+    proposal = ctx.pending_scheduled_proposal or {}
+    proposal_id = str(proposal.get("proposal_id") or "")
+    console = get_console()
+    try:
+        import httpx
+
+        from src.config.accessor import get_env_config, reset_env_config
+
+        reset_env_config()
+        api_config = get_env_config().api
+        base = api_config.vibe_trading_api_url.rstrip("/")
+        key = api_config.api_auth_key.strip()
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        endpoint = "commit" if token in {"y", "yes", "确认"} else "discard"
+        response = httpx.post(
+            f"{base}/scheduled-runs/proposals/{proposal_id}/{endpoint}",
+            headers=headers,
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if token in {"y", "yes", "确认"}:
+            action = "创建" if proposal.get("operation") == "create" else "取消"
+            console.print(
+                f"[green]定时研究任务已{action}:[/green] "
+                f"{result.get('committed_job_id') or '?'}"
+            )
+        else:
+            console.print("[dim]已放弃这次定时研究变更。[/dim]")
+    except Exception as exc:  # noqa: BLE001 - keep proposal open for retry
+        console.print(f"[red]定时研究确认失败:[/red] {exc}")
+        return True
+    ctx.pending_scheduled_proposal = None
+    return True
+
+
+def _choose_mandate_account(accounts: List[Dict[str, Any]]) -> str:
+    """Ask the user which broker account a mandate may trade.
+
+    Only accounts the broker lists as active and open to agentic trading are
+    offered, and nothing is preselected: an empty reply commits nothing.
+
+    Args:
+        accounts: Picker rows from ``GET /live/accounts``.
+
+    Returns:
+        The chosen ``account_ref``, or ``""`` when the user chose none or no
+        account is usable.
+    """
+    console = get_console()
+    usable = [row for row in accounts if not row.get("deactivated") and row.get("agentic_allowed")]
+    if not usable:
+        console.print("[yellow]The broker lists no active account that allows agentic trading.[/yellow]")
+        return ""
+    console.print("[bold]Which account may this mandate trade?[/bold]")
+    for index, row in enumerate(usable, start=1):
+        default = " [dim](broker default)[/dim]" if row.get("is_default") else ""
+        console.print(f"  [{index}] {row.get('label')}{default}")
+    try:
+        raw = input("account > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    if not raw.isdigit() or not 1 <= int(raw) <= len(usable):
+        return ""
+    return str(usable[int(raw) - 1]["account_ref"])
+
+
+def _commit_mandate(
+    proposal: Dict[str, Any],
+    selected_ordinal: int,
+    *,
+    choose_account: Any = None,
+) -> Dict[str, Any]:
     """Commit a mandate selection via the surface commit endpoint.
 
     This is the single privileged write that activates a mandate. The pick is a
@@ -975,6 +1178,10 @@ def _commit_mandate(proposal: Dict[str, Any], selected_ordinal: int) -> Dict[str
         proposal: The outstanding ``mandate.proposal`` payload (binds the commit
             to the exact rendered options via ``proposal_id``).
         selected_ordinal: The 1-based profile the user picked.
+        choose_account: Account chooser taking the ``/live/accounts`` rows;
+            defaults to :func:`_choose_mandate_account`. Used only for a broker
+            whose mandate must be bound to one account, and never fed an
+            account the proposal carries: the agent does not choose it.
 
     Returns:
         The decoded commit response (``mandate_id`` / ``consent_record_id`` on
@@ -982,16 +1189,48 @@ def _commit_mandate(proposal: Dict[str, Any], selected_ordinal: int) -> Dict[str
     """
     import httpx
 
-    base = os.environ.get("VIBE_TRADING_API_URL", "http://127.0.0.1:8000").rstrip("/")
-    body = {
-        "proposal_id": proposal.get("proposal_id"),
-        "selected_ordinal": selected_ordinal,
-        "adjustments": None,
-        "session_id": proposal.get("session_id"),
-        "consent_ack": True,
-    }
+    from src.api.live_routes import CommitMandateRequest
+    from src.config.accessor import get_env_config, reset_env_config
+
+    reset_env_config()
+    api_config = get_env_config().api
+    base = api_config.vibe_trading_api_url.rstrip("/")
+    key = api_config.api_auth_key.strip()
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
-        response = httpx.post(f"{base}/mandate/commit", json=body, timeout=30.0)
+        account = proposal.get("account") or {}
+        body = CommitMandateRequest.model_validate(
+            {
+                "broker": account.get("broker"),
+                "proposal_id": proposal.get("proposal_id"),
+                "selected_ordinal": selected_ordinal,
+                "adjustments": None,
+                "session_id": proposal.get("session_id"),
+                "account_ref": account.get("account_ref", ""),
+                "consent_ack": True,
+            }
+        ).model_dump(mode="json")
+
+        listing = httpx.get(
+            f"{base}/live/accounts",
+            params={"broker": body["broker"]},
+            headers=headers,
+            timeout=30.0,
+        )
+        listing.raise_for_status()
+        accounts = listing.json()
+        if accounts.get("account_selection_required"):
+            chooser = choose_account or _choose_mandate_account
+            body["account_ref"] = chooser(list(accounts.get("accounts") or []))
+            if not body["account_ref"]:
+                return {"status": "error", "error": "no account was chosen for this mandate"}
+
+        response = httpx.post(
+            f"{base}/mandate/commit",
+            json=body,
+            headers=headers,
+            timeout=30.0,
+        )
         response.raise_for_status()
         return response.json()
     except Exception as exc:  # noqa: BLE001 — surface a clean error to the user
@@ -1047,8 +1286,13 @@ def _handle_proposal_reply(text: str, ctx: InteractiveContext) -> bool:
     return True
 
 
-def _interactive_loop(max_iter: int) -> int:
+def _interactive_loop(max_iter: int, resume_session_id: Optional[str] = None) -> int:
     """Drive the new interactive REPL.
+
+    Args:
+        max_iter: Maximum ReAct iterations per turn.
+        resume_session_id: If set, load this specific session instead of
+            prompting to resume the most recent one.
 
     Returns:
         Process exit code (always ``0`` on a clean exit).
@@ -1060,15 +1304,36 @@ def _interactive_loop(max_iter: int) -> int:
     # the prompt appear only after the user presses Enter.
 
     ctx = InteractiveContext(max_iter=max_iter)
+    pending_input: Optional[str] = None
 
-    # Offer to resume the most recent session. Audit item 8.
-    resume = _maybe_resume_last_session(console)
-    if resume is not None:
-        ctx.session_id = resume["session_id"]
-        ctx.history = list(resume["history"])
+    if resume_session_id:
+        # Resume a specific session by ID (``vibe-trading resume <session-id>``).
+        try:
+            store = _session_store()
+            session = store.get_session(resume_session_id)
+        except Exception:  # noqa: BLE001
+            session = None
+        if session is None:
+            console.print(f"[red]Session {resume_session_id} not found[/red]")
+            return 1
+        ctx.session_id = resume_session_id
+        ctx.history = _build_session_history(store, resume_session_id)
         console.print(
-            f"[dim]Resumed session: {resume['title']} ({len(ctx.history)} prior turns)[/dim]"
+            f"[dim]Resumed session: {session.title or session.session_id} "
+            f"({len(ctx.history)} prior turns)[/dim]"
         )
+    else:
+        # Offer to resume the most recent session. Audit item 8.
+        resume = _maybe_resume_last_session(console)
+        if resume is not None:
+            if "pending_input" in resume:
+                pending_input = str(resume["pending_input"])
+            else:
+                ctx.session_id = resume["session_id"]
+                ctx.history = list(resume["history"])
+                console.print(
+                    f"[dim]Resumed session: {resume['title']} ({len(ctx.history)} prior turns)[/dim]"
+                )
 
     # Build the prompt session once so history + completer persist.
     try:
@@ -1087,27 +1352,31 @@ def _interactive_loop(max_iter: int) -> int:
     session = make_session()
 
     while True:
-        _print_recap_if_needed(console, ctx)
-        try:
-            user_input = get_user_input(session=session)
-        except KeyboardInterrupt:
-            # Should not reach here — the keybinding raises EOFError instead.
-            continue
-        except EOFError:
-            # Two interpretations: Ctrl+D (always exit), or Ctrl+C on an
-            # empty line (show hint, exit on second press).
-            #
-            # ``ctrl_c_within_window`` reads a press-time decision cached
-            # by the keybinding: True iff the gap between the *previous*
-            # Ctrl+C press and *this* one is < 2 s. First press → False
-            # (no prior press) → we print the hint and continue. Second
-            # press inside the window → True → we break.
-            if ctrl_c_within_window(session, window_sec=2.0):
-                break
-            console.print(
-                "[dim]Press Ctrl+C again within 2s, Ctrl+D, or type /quit to exit[/dim]"
-            )
-            continue
+        if pending_input is not None:
+            user_input = pending_input
+            pending_input = None
+        else:
+            _print_recap_if_needed(console, ctx)
+            try:
+                user_input = get_user_input(session=session)
+            except KeyboardInterrupt:
+                # Should not reach here — the keybinding raises EOFError instead.
+                continue
+            except EOFError:
+                # Two interpretations: Ctrl+D (always exit), or Ctrl+C on an
+                # empty line (show hint, exit on second press).
+                #
+                # ``ctrl_c_within_window`` reads a press-time decision cached
+                # by the keybinding: True iff the gap between the *previous*
+                # Ctrl+C press and *this* one is < 2 s. First press → False
+                # (no prior press) → we print the hint and continue. Second
+                # press inside the window → True → we break.
+                if ctrl_c_within_window(session, window_sec=2.0):
+                    break
+                console.print(
+                    "[dim]Press Ctrl+C again within 2s, Ctrl+D, or type /quit to exit[/dim]"
+                )
+                continue
 
         text = user_input.strip()
         if not text:
@@ -1120,6 +1389,13 @@ def _interactive_loop(max_iter: int) -> int:
             _trip_halt_from_repl(console, reason=f"repl turn: {text}")
             ctx.pending_proposal = None
             continue
+
+        # Scheduled research confirmation is a surface commit. Exact y/N
+        # replies are intercepted before the model; any other text remains a
+        # normal conversational adjustment request.
+        if ctx.pending_scheduled_proposal is not None and not text.startswith("/"):
+            if _handle_scheduled_proposal_reply(text, ctx):
+                continue
 
         # Mandate pick — when a proposal is outstanding, a bare numeric reply
         # is a COMMIT handled here (the model never sees it). An adjust reply
@@ -1145,6 +1421,9 @@ def _interactive_loop(max_iter: int) -> int:
             if slash_name == "connector":
                 _run_connector_command_from_repl(console, slash_tokens[1:])
                 continue
+            if slash_name == "data":  # QVERIS-INTEGRATION
+                _run_data_command_from_repl(console, slash_tokens[1:])  # QVERIS-INTEGRATION
+                continue  # QVERIS-INTEGRATION
             rc = _dispatch_slash(text, ctx)
             if rc == 2:
                 break
@@ -1161,6 +1440,10 @@ def _interactive_loop(max_iter: int) -> int:
         _run_one_turn(text, ctx)
 
     console.print("[dim]Goodbye[/dim]")
+    if ctx.session_id:
+        console.print(
+            f"[dim]To resume this session:[/dim] [bold]vibe-trading resume {ctx.session_id}[/bold]"
+        )
     return 0
 
 
@@ -1189,6 +1472,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         Process exit code.
     """
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+
+    # One-time move of pre-#904 code-relative state into the runtime root.
+    # A failed migration must never block the CLI.
+    try:
+        from src.config import migrate as _migrate
+
+        _migrate.migrate_legacy_state()
+    except Exception:  # pragma: no cover — best-effort
+        logging.getLogger(__name__).warning(
+            "Legacy state migration failed", exc_info=True
+        )
+
     interactive = _is_interactive_invocation(raw_argv)
 
     if interactive:
@@ -1199,6 +1494,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         # the new loop can read them directly without re-parsing argv.
         max_iter = _extract_max_iter(raw_argv, default=50)
         return _interactive_loop(max_iter)
+
+    # Handle ``vibe-trading resume <session-id>`` — enter the interactive
+    # loop with a specific session loaded, bypassing the legacy dispatcher.
+    if len(raw_argv) == 2 and raw_argv[0] == "resume":
+        max_iter = _extract_max_iter(raw_argv, default=50)
+        return _interactive_loop(max_iter=max_iter, resume_session_id=raw_argv[1])
 
     # Delegate every other path to the legacy dispatcher.
     try:
@@ -1273,7 +1574,7 @@ def _build_typer_app():  # type: ignore[no-untyped-def]
 
     @app.command("serve", help="Start the FastAPI server.")
     def _serve(
-        host: str = typer.Option("0.0.0.0", "--host"),
+        host: str = typer.Option("127.0.0.1", "--host"),
         port: int = typer.Option(8000, "--port"),
         dev: bool = typer.Option(False, "--dev", help="Also boot the Vite dev server."),
     ) -> None:
@@ -1293,6 +1594,40 @@ def _build_typer_app():  # type: ignore[no-untyped-def]
     @app.command("init", help="Re-run the interactive setup wizard.")
     def _init() -> None:
         run_onboarding(console=get_console())
+
+    @app.command("setup", help="Install frontend deps and build the production bundle (cross-platform).")
+    def _setup(
+        frontend_dir: str = typer.Option(
+            "frontend",
+            "--frontend-dir",
+            help="Path to the frontend directory (relative to repo root or absolute).",
+        ),
+    ) -> None:
+        sys.exit(main(["setup", "--frontend-dir", frontend_dir]))
+
+    @app.command("dev", help="Start backend + Vite dev server in one process.")
+    def _dev(
+        port: int = typer.Option(8899, "--port", help="Backend port."),
+        frontend_port: int = typer.Option(
+            5899,
+            "--frontend-port",
+            help="Vite dev server port (must match vite.config.ts).",
+        ),
+        frontend_dir: str = typer.Option("frontend", "--frontend-dir"),
+    ) -> None:
+        sys.exit(
+            main(
+                [
+                    "dev",
+                    "--port",
+                    str(port),
+                    "--frontend-port",
+                    str(frontend_port),
+                    "--frontend-dir",
+                    frontend_dir,
+                ]
+            )
+        )
 
     return app
 

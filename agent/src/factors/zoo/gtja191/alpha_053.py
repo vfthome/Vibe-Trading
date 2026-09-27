@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #53 - 高低价差比
+# 简要说明: (-1*RANK(DELTA(MEAN(CLOSE,6),3))*RANK((CLOSE-MEAN(CLOSE,6))/MEAN(CLOSE,6)))，均值变化与偏离度的组合。
+# 典型用途: 均线趋势变化与当前偏离度的综合信号。
+# ============================================================
 """GTJA Alpha #53.
 
 Formula: COUNT(CLOSE>DELAY(CLOSE,1),12)/12*100
@@ -41,5 +47,6 @@ __alpha_meta__ = {
 
 def compute(panel: dict) -> pd.DataFrame:
     c = panel["close"]
-    up = (c > c.shift(1)).astype(float)
+    # A missing close or prior close is not a down day (#1463).
+    up = (c > c.shift(1)).astype(float).where(c.notna() & c.shift(1).notna())
     return up.rolling(12, min_periods=12).sum() / 12.0 * 100.0

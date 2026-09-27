@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #74
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第74号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #74.
 
 Formula (paper appendix): (rank(correlation(close, sum(adv30,37), 15)) < rank(correlation(rank(0.026*high+0.974*vwap), rank(volume), 11))) * -1
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['high', 'close', 'volume', 'vwap'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 60,
@@ -64,4 +71,9 @@ def compute(panel: dict) -> pd.DataFrame:
     mix = high * 0.0261661 + vwap * (1.0 - 0.0261661)
     rhs = rank(ts_corr(rank(mix), rank(volume), 11))
     out = (lhs < rhs).astype(float) * -1.0
-    return out
+    # A NaN comparison is False, not NaN, so lhs/rhs's warmup NaN falls
+    # through to a fabricated finite value instead of propagating NaN.
+    # Mask on the inputs' reach, not the operands' NaN: a constant window's
+    # correlation is undefined on complete data and keeps its verdict (#1452).
+    # volume: adv30 + sum 37 + corr 15; close: corr 15; high/vwap: corr 11.
+    return out.where(observed_over((volume, 80), (close, 15), (high, 11), (vwap, 11)))

@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #148
+# 简要说明: 国泰君安191短周期交易型alpha因子第148号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha 148 (国泰君安 191 短周期交易型 alpha 因子, 2014).
 
 Formula (verbatim from the report):
@@ -57,5 +63,6 @@ def compute(panel):
     v = panel["volume"]
     left = rank(ts_corr(o, ts_mean(v, 60).rolling(9).sum(), 6))
     right = rank(o - ts_min(o, 14))
-    out = (left < right).astype("float64") * -1.0
+    # A comparison with a missing side is missing, not False (#1463).
+    out = (left < right).astype("float64").where(left.notna() & right.notna()) * -1.0
     return out

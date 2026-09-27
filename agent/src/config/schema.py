@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -11,13 +12,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # wildcard ``enabled_tools`` (which would re-admit every WRITE/UNKNOWN tool) is
 # rejected at config-load time unless a broker-specific read-only OAuth probe is
 # explicitly documented below.
-LIVE_BROKER_SERVER_KEYS: frozenset[str] = frozenset({"robinhood", "ibkr"})
+LIVE_BROKER_SERVER_KEYS: frozenset[str] = frozenset({"robinhood", "ibkr", "scalable"})
 
 # URL host suffix -> canonical live-broker key. Detection by host prevents an
 # aliased config key from bypassing the wildcard rejection / classification gate.
 LIVE_BROKER_URL_HOST_SUFFIX_TO_KEY: dict[str, str] = {
     "robinhood.com": "robinhood",
     "ibkr.com": "ibkr",
+    "scalable.capital": "scalable",
 }
 
 # Live-broker URL host suffixes. Detecting a live broker by config key alone is
@@ -43,6 +45,10 @@ LIVE_BROKER_READONLY_WILDCARD_ALLOWED_EXTRA_SCOPES: dict[str, frozenset[str]] = 
 LIVE_BROKER_WRITE_SCOPES: dict[str, frozenset[str]] = {
     "ibkr": frozenset({"mcp.write"}),
 }
+ROBINHOOD_AGENT_CONFIG_PATH = "~/.vibe-trading/agent.json"
+LIVE_BROKER_WILDCARD_ALLOWLIST_ERROR = (
+    "enabledTools allowlist ('*'); pin an explicit read-only tool list"
+)
 
 
 def _url_host(url: str) -> str:
@@ -184,6 +190,11 @@ def _allows_readonly_wildcard_probe(
 ROBINHOOD_MCP_SERVER_SEED: dict[str, object] = {
     "type": "streamableHttp",
     "url": "https://agent.robinhood.com/mcp/trading",
+    # Robinhood OAuth can require human face verification. Keep normal remote
+    # tool calls on the default 30s budget while giving the initial
+    # OAuth/initialize round-trip the same 300s window as FastMCP's callback
+    # server.
+    "init_timeout": 300.0,
     "auth": {
         "type": "oauth",
         "scopes": ["trading.read"],
@@ -194,14 +205,16 @@ ROBINHOOD_MCP_SERVER_SEED: dict[str, object] = {
     # READ tool names (``src.trading.connectors.robinhood.classification.ROBINHOOD_TOOL_CLASS``).
     # These MUST match the curated map's READ entries: a name here that the map
     # does not classify READ would resolve UNKNOWN -> gated -> refused, silently
-    # hiding the real read tool. Canonical READ catalog: get_account,
-    # get_positions, get_quotes, list_orders. WRITE (place_order, cancel_order)
-    # is never seeded — the user adds those by hand once a mandate exists.
+    # hiding the real read tool. Canonical READ catalog: get_accounts,
+    # get_portfolio, get_equity_positions, get_equity_quotes, get_equity_orders.
+    # WRITE (place_equity_order, cancel_equity_order) is never seeded — the user
+    # adds those by hand once a mandate exists.
     "enabled_tools": [
-        "get_account",
-        "get_positions",
-        "get_quotes",
-        "list_orders",
+        "get_accounts",
+        "get_portfolio",
+        "get_equity_positions",
+        "get_equity_quotes",
+        "get_equity_orders",
     ],
 }
 
@@ -214,7 +227,7 @@ ROBINHOOD_MCP_SERVER_SEED: dict[str, object] = {
 # config must pin an explicit tool allowlist plus pass the live order gate.
 IBKR_MCP_SERVER_SEED: dict[str, object] = {
     "type": "streamableHttp",
-    "url": "https://api.ibkr.com/v1/api/mcp",
+    "url": "https://api.ibkr.com/v1/api/mcp-public",
     "auth": {
         "type": "oauth",
         "scopes": ["mcp.read"],
@@ -222,6 +235,51 @@ IBKR_MCP_SERVER_SEED: dict[str, object] = {
         "cache_dir": "~/.vibe-trading/live/ibkr/oauth",
     },
     "enabled_tools": ["*"],
+}
+
+# Canonical seed for Scalable Capital's Agentic Investing MCP server, shipped
+# OFF-by-default read-only: an explicit READ allowlist (never ``["*"]``), OAuth
+# auth, and the streamableHttp transport. Scalable has no paper environment, so
+# there is nothing to discriminate: order-path tools are pinned WRITE in
+# ``src/trading/connectors/scalable/classification.py``, are NOT seeded
+# here, and the profile that carries this server exposes no order capability.
+#
+# ``scopes`` is intentionally omitted: Scalable does not publish its OAuth scope
+# names, and an invented scope would fail authorization rather than a read. The
+# allowlist below MUST stay equal to the curated READ entries — a name here that
+# the curated map does not classify READ resolves UNKNOWN -> gated -> refused,
+# silently hiding a real read tool.
+SCALABLE_MCP_SERVER_SEED: dict[str, object] = {
+    "type": "streamableHttp",
+    "url": "https://mcp.scalable.capital/mcp",
+    "auth": {
+        "type": "oauth",
+        "client_name": "Vibe-Trading",
+        "cache_dir": "~/.vibe-trading/live/scalable/oauth",
+    },
+    "enabled_tools": [
+        # account & portfolio
+        "get_account_profile",
+        "list_accessible_portfolios",
+        "get_portfolio_overview",
+        "get_portfolio_holdings",
+        "get_portfolio_cash_breakdown",
+        "get_portfolio_performance",
+        "list_portfolio_transactions",
+        "get_transaction_details",
+        "get_overnight_summary",
+        # market data
+        "search_securities",
+        "search_derivatives",
+        "get_security_quote",
+        "get_security_chart",
+        "get_security_news",
+        # watchlist / alerts / savings-plan state
+        "list_watchlist_items",
+        "list_price_alerts",
+        "list_savings_plans",
+        "get_savings_plan_config",
+    ],
 }
 
 
@@ -236,6 +294,54 @@ def _to_camel(name: str) -> str:
     """
     parts = name.split("_")
     return parts[0] + "".join(part.capitalize() for part in parts[1:])
+
+
+def _to_wire_config_value(value: object) -> object:
+    """Convert internal snake_case seed keys to external config aliases."""
+    if isinstance(value, dict):
+        return {_to_camel(str(key)): _to_wire_config_value(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_to_wire_config_value(child) for child in value]
+    return value
+
+
+def robinhood_readonly_enabled_tools() -> tuple[str, ...]:
+    """Return the canonical Robinhood read-only tool allowlist."""
+    enabled_tools = ROBINHOOD_MCP_SERVER_SEED["enabled_tools"]
+    if not isinstance(enabled_tools, list):
+        return ()
+    return tuple(str(tool) for tool in enabled_tools)
+
+
+def robinhood_mcp_server_seed_config() -> dict[str, object]:
+    """Return the copy-pasteable Robinhood ``mcpServers`` config seed."""
+    return {
+        "mcpServers": {
+            "robinhood": _to_wire_config_value(ROBINHOOD_MCP_SERVER_SEED),
+        }
+    }
+
+
+def format_robinhood_mcp_server_seed_json() -> str:
+    """Format the canonical Robinhood read-only ``mcpServers`` seed as JSON."""
+    return json.dumps(robinhood_mcp_server_seed_config(), indent=2)
+
+
+def format_robinhood_mcp_config_guidance(*, reason: str = "missing") -> str:
+    """Build operator-facing guidance for enabling Robinhood MCP safely."""
+    tools = ", ".join(robinhood_readonly_enabled_tools())
+    if reason == "wildcard":
+        lead = (
+            'Robinhood MCP config uses enabledTools: ["*"], which is not allowed for '
+            "live brokers."
+        )
+    else:
+        lead = "Robinhood MCP server is missing from mcpServers."
+    return (
+        f"{lead} Add the safe read-only Robinhood seed to {ROBINHOOD_AGENT_CONFIG_PATH} "
+        f"with explicit enabledTools: {tools}.\n"
+        f"{format_robinhood_mcp_server_seed_json()}"
+    )
 
 
 class ConfigBase(BaseModel):
@@ -297,6 +403,7 @@ class MCPServerConfig(ConfigBase):
     headers: dict[str, str] = Field(default_factory=dict)
     auth: MCPOAuthConfig | None = None
     tool_timeout: float = Field(default=30.0, ge=0.1)
+    init_timeout: float | None = Field(default=None, ge=0.1)
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])
 
     def resolved_transport(self) -> Literal["stdio", "sse", "streamableHttp"]:
@@ -361,13 +468,48 @@ class MCPServerConfigOverride(ConfigBase):
     headers: dict[str, str] | None = None
     auth: MCPOAuthConfig | None = None
     tool_timeout: float | None = Field(default=None, ge=0.1)
+    init_timeout: float | None = Field(default=None, ge=0.1)
     enabled_tools: list[str] | None = None
+
+
+class DeliveryTargetConfig(ConfigBase):
+    """Operator-owned reusable destination for scheduled delivery."""
+
+    label: str = Field(min_length=1, max_length=128)
+    channel: str = Field(min_length=1, max_length=64)
+    target: str = Field(min_length=1, max_length=512)
+    enabled: bool = True
+
+
+class ChannelsConfig(ConfigBase):
+    """Top-level IM channel config.
+
+    Built-in adapters parse their own per-channel sections. This model keeps
+    the operator file strict for global fields while allowing platform-specific
+    channel keys such as ``telegram`` or ``feishu``.
+    """
+
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True, extra="allow")
+
+    send_progress: bool = True
+    send_tool_hints: bool = False
+    send_max_retries: int = Field(default=2, ge=1, le=10)
+    reply_timeout_s: float = Field(default=600.0, ge=1.0, le=86400.0)
+    # Channel-independent operator allowlist. Sender IDs listed here may run
+    # ``/pairing`` control-plane commands from any IM channel with cross-channel
+    # authority. Empty by default (fail closed): with no operators configured,
+    # IM ``/pairing`` is rejected and pairing is managed only through the
+    # authenticated CLI/REST admin plane. Per-channel operators (channel-scoped
+    # authority) live under each channel section's own ``operators`` list.
+    operators: list[str] = Field(default_factory=list)
+    delivery_targets: dict[str, DeliveryTargetConfig] = Field(default_factory=dict)
 
 
 class AgentConfig(ConfigBase):
     """Top-level structured agent config."""
 
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
 
     @model_validator(mode="after")
     def validate_live_broker_servers(self) -> "AgentConfig":
@@ -392,9 +534,16 @@ class AgentConfig(ConfigBase):
             if is_live_broker_entry(server_key, server) and "*" in server.enabled_tools:
                 if _allows_readonly_wildcard_probe(server_key, server):
                     continue
+                broker = live_broker_key_for_entry(server_key, server)
+                if broker == "robinhood":
+                    detail = (
+                        f"{LIVE_BROKER_WILDCARD_ALLOWLIST_ERROR}. "
+                        f"{format_robinhood_mcp_config_guidance(reason='wildcard')}"
+                    )
+                else:
+                    detail = LIVE_BROKER_WILDCARD_ALLOWLIST_ERROR
                 raise ValueError(
-                    f"Live-broker MCP server '{server_key}' may not use a wildcard "
-                    "enabledTools allowlist ('*'); pin an explicit read-only tool list"
+                    f"Live-broker MCP server '{server_key}' may not use a wildcard {detail}"
                 )
         return self
 
@@ -416,3 +565,4 @@ class AgentConfigOverride(ConfigBase):
     )
 
     mcp_servers: dict[str, MCPServerConfigOverride] = Field(default_factory=dict)
+    channels: ChannelsConfig | None = None

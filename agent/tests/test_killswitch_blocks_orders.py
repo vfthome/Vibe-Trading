@@ -27,6 +27,7 @@ from src.live.mandate.model import (
 )
 from src.live.order_guard import LiveOrderGuardTool
 from src.tools.mcp import MCPRemoteTool, MCPRemoteToolSpec
+from tests import robinhood_mcp_helpers as rh
 
 
 @pytest.fixture
@@ -42,18 +43,18 @@ class _MockAdapter:
 
     def call_tool(self, remote_name: str, arguments: dict, *, local_name: str | None = None) -> dict:
         self.calls.append(remote_name)
-        if remote_name in ("get_positions", "list_positions"):
-            return {"positions": [], "status": "ok"}
-        if remote_name in ("get_account", "get_balance", "get_buying_power"):
-            return {"equity": 5000.0, "status": "ok"}
+        if remote_name == "get_equity_positions":
+            return rh.positions([])
+        if remote_name == "get_portfolio":
+            return rh.portfolio()
         return {"status": "ok", "order_id": "rh_x", "state": "accepted"}
 
 
 def _order_spec() -> MCPRemoteToolSpec:
     return MCPRemoteToolSpec(
         server_name="robinhood",
-        remote_name="place_order",
-        local_name="mcp_robinhood_place_order",
+        remote_name="place_equity_order",
+        local_name="mcp_robinhood_place_equity_order",
         description="Place an order.",
         parameters={"type": "object", "properties": {}, "additionalProperties": True},
     )
@@ -62,8 +63,8 @@ def _order_spec() -> MCPRemoteToolSpec:
 def _read_spec() -> MCPRemoteToolSpec:
     return MCPRemoteToolSpec(
         server_name="robinhood",
-        remote_name="get_positions",
-        local_name="mcp_robinhood_get_positions",
+        remote_name="get_equity_positions",
+        local_name="mcp_robinhood_get_equity_positions",
         description="Read positions.",
         parameters={"type": "object", "properties": {}, "additionalProperties": True},
     )
@@ -139,4 +140,4 @@ def test_read_tools_unaffected_by_halt(live_runtime: Path) -> None:
 
     payload = json.loads(read_tool.execute())
     assert payload["status"] == "ok"
-    assert adapter.calls == ["get_positions"]
+    assert adapter.calls == ["get_equity_positions"]

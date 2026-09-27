@@ -1,8 +1,10 @@
-import { memo, useCallback, useState } from "react";
+import i18n from '@/i18n';
+import { memo, useCallback, useEffect, useState } from "react";
 import { ShieldCheck, ShieldAlert, Wallet, OctagonX, SlidersHorizontal, Check, X, Loader2 } from "lucide-react";
 import { toast } from "sonner";
-import { api, type MandateProfile, type MandateProposal } from "@/lib/api";
+import { api, type BrokerAccountChoice, type MandateProfile, type MandateProposal } from "@/lib/api";
 import { AgentAvatar } from "./AgentAvatar";
+import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 
 interface Props {
   proposal: MandateProposal;
@@ -25,12 +27,18 @@ function formatUsd(value: number): string {
   return `$${value.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
 }
 
+function translateManifestKey(key: string, values: Record<string, string | number>): string {
+  return String(i18n.t(key as never, values as never));
+}
+
 function formatLeverage(leverage: MandateProfile["leverage"]): string {
   if (typeof leverage === "number") {
-    return leverage <= 1 ? "no leverage" : `${leverage}× leverage`;
+    return leverage <= 1
+      ? i18n.t("mandate.noLeverage")
+      : i18n.t("mandate.leverageValue", { value: leverage });
   }
   const lowered = leverage.toLowerCase();
-  return lowered === "none" || lowered === "" ? "no leverage" : leverage;
+  return lowered === "none" || lowered === "" ? i18n.t("mandate.noLeverage") : leverage;
 }
 
 function formatUniverse(universe: MandateProfile["universe"]): string {
@@ -89,32 +97,34 @@ function ProfileTile({
           onClick={onAdjustToggle}
           disabled={disabled}
           className="inline-flex items-center gap-1 rounded-lg border px-2 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-          title="Adjust this mandate"
+          title={i18n.t("mandate.adjustTitle")}
         >
           <SlidersHorizontal className="h-3 w-3" />
-          Adjust
+          {i18n.t("mandate.adjust")}
         </button>
       </div>
 
       <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px]">
         <div className="col-span-2">
-          <dt className="text-muted-foreground">Universe</dt>
+          <dt className="text-muted-foreground">{i18n.t("mandate.universe")}</dt>
           <dd className="font-medium text-foreground">{formatUniverse(profile.universe)}</dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">Max order</dt>
+          <dt className="text-muted-foreground">{i18n.t("mandate.maxOrder")}</dt>
           <dd className="font-mono font-medium text-foreground">{formatUsd(profile.max_order_usd)}</dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">Daily cap</dt>
-          <dd className="font-mono font-medium text-foreground">{profile.daily_trade_cap} trades/day</dd>
+          <dt className="text-muted-foreground">{i18n.t("mandate.dailyCap")}</dt>
+          <dd className="font-mono font-medium text-foreground">
+            {i18n.t("mandate.tradesPerDay", { count: profile.daily_trade_cap })}
+          </dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">Leverage</dt>
+          <dt className="text-muted-foreground">{i18n.t("mandate.leverage")}</dt>
           <dd className="font-medium text-foreground">{formatLeverage(profile.leverage)}</dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">Instruments</dt>
+          <dt className="text-muted-foreground">{i18n.t("mandate.instruments")}</dt>
           <dd className="font-medium text-foreground">{profile.instruments.join(", ") || "—"}</dd>
         </div>
       </dl>
@@ -129,6 +139,7 @@ function ProfileTile({
             type="text"
             value={adjustText}
             autoFocus
+            aria-label={i18n.t("mandate.adjustInputLabel")}
             onChange={(e) => setAdjustText(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") {
@@ -138,7 +149,7 @@ function ProfileTile({
                 onAdjustCancel();
               }
             }}
-            placeholder="e.g. keep this but raise the daily cap to 10"
+            placeholder={i18n.t("mandate.adjustPlaceholder")}
             className="w-full rounded-lg border bg-background px-3 py-1.5 text-xs text-foreground outline-none focus:ring-2 focus:ring-primary/30"
           />
           <div className="flex justify-end gap-2">
@@ -148,7 +159,7 @@ function ProfileTile({
               className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
             >
               <X className="h-3 w-3" />
-              Cancel
+              {i18n.t("mandate.cancel")}
             </button>
             <button
               type="button"
@@ -157,7 +168,7 @@ function ProfileTile({
               className="inline-flex items-center gap-1 rounded-lg bg-primary px-2 py-1 text-[11px] font-medium text-primary-foreground transition-opacity disabled:opacity-40"
             >
               <Check className="h-3 w-3" />
-              Send adjustment
+              {i18n.t("mandate.sendAdjustment")}
             </button>
           </div>
         </div>
@@ -169,7 +180,7 @@ function ProfileTile({
           className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
         >
           {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
-          {busy ? "Committing…" : `Commit “${profile.label}”`}
+          {busy ? i18n.t("mandate.committing") : i18n.t("mandate.commit", { label: profile.label })}
         </button>
       )}
     </div>
@@ -184,16 +195,45 @@ function ProfileTile({
  * never `api.sendMessage`. "Adjust" sends a natural-language message back to the agent
  * to re-render a fresh proposal. Once committed, the card collapses to a compact badge.
  */
+type AccountOptions =
+  | { status: "idle" | "loading" }
+  | { status: "ready"; required: boolean; accounts: BrokerAccountChoice[] }
+  | { status: "error"; error: string };
+
 export const MandateProposalCard = memo(function MandateProposalCard({ proposal, committed, onAdjust }: Props) {
   const [busyOrdinal, setBusyOrdinal] = useState<number | null>(null);
   const [adjustingOrdinal, setAdjustingOrdinal] = useState<number | null>(null);
+  const [pendingOrdinal, setPendingOrdinal] = useState<number | null>(null);
+  const [accountOptions, setAccountOptions] = useState<AccountOptions>({ status: "idle" });
+  const [accountRef, setAccountRef] = useState("");
+  const broker = proposal.account?.broker?.trim().toLowerCase() ?? "";
+
+  // The account is chosen by the user in the confirm step, from the broker's own
+  // list. The proposal (written by the agent) never carries one, and nothing is
+  // preselected: a mandate must not silently bind to the broker's default account.
+  useEffect(() => {
+    if (pendingOrdinal == null || !broker || accountOptions.status !== "idle") return;
+    setAccountOptions({ status: "loading" });
+    api.getLiveAccounts(broker)
+      .then((result) => setAccountOptions({
+        status: "ready",
+        required: result.account_selection_required,
+        accounts: result.accounts,
+      }))
+      .catch((error) => setAccountOptions({
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      }));
+  }, [pendingOrdinal, broker, accountOptions.status]);
+
+  const accountRequired = accountOptions.status === "ready" && accountOptions.required;
+  const accountReady = accountOptions.status === "ready" && (!accountOptions.required || Boolean(accountRef));
 
   const handleCommit = useCallback(
-    async (ordinal: number) => {
+    async (ordinal: number, selectedAccount: string) => {
       if (busyOrdinal != null) return;
-      const broker = proposal.account?.broker?.trim().toLowerCase();
       if (!broker) {
-        toast.error("Cannot commit mandate: connector broker is missing. Ask the agent to regenerate the proposal.");
+        toast.error(i18n.t("mandate.noBroker"));
         return;
       }
       setBusyOrdinal(ordinal);
@@ -205,16 +245,19 @@ export const MandateProposalCard = memo(function MandateProposalCard({ proposal,
           adjustments: null,
           consent_ack: true,
           session_id: proposal.session_id,
+          ...(selectedAccount ? { account_ref: selectedAccount } : {}),
         });
         // Card collapses to the active-mandate badge when the mandate.committed
         // SSE event arrives; no optimistic state-write here.
       } catch (error) {
         setBusyOrdinal(null);
-        toast.error(error instanceof Error ? error.message : "Failed to commit mandate.");
+        toast.error(error instanceof Error ? error.message : i18n.t("mandate.failedToCommit"));
       }
     },
-    [busyOrdinal, proposal.account?.broker, proposal.proposal_id, proposal.session_id],
+    [busyOrdinal, broker, proposal.proposal_id, proposal.session_id],
   );
+
+  const pendingProfile = proposal.profiles.find((p) => p.ordinal === pendingOrdinal) ?? null;
 
   // Collapsed state: a compact active-mandate badge (same visual family as the goal badge).
   if (committed) {
@@ -229,15 +272,25 @@ export const MandateProposalCard = memo(function MandateProposalCard({ proposal,
           <span className="inline-flex max-w-full flex-wrap items-center gap-1.5 rounded-lg bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
             <ShieldCheck className="h-3 w-3 shrink-0" />
             <span className="shrink-0">
-              Mandate {committed.selected_ordinal != null ? `#${committed.selected_ordinal} ` : ""}active
+              {i18n.t("mandate.mandateActive", {
+                id: committed.selected_ordinal != null ? `#${committed.selected_ordinal}` : "",
+              })}
             </span>
             {maxOrder != null && (
-              <span className="shrink-0 font-mono text-[11px]">· ≤{formatUsd(maxOrder)}/order</span>
+              <span className="shrink-0 font-mono text-[11px]">
+                · {translateManifestKey("mandate.maxPerOrder", { amount: formatUsd(maxOrder) })}
+              </span>
             )}
-            {dailyCap != null && <span className="shrink-0 font-mono text-[11px]">· {dailyCap}/day</span>}
+            {dailyCap != null && (
+              <span className="shrink-0 font-mono text-[11px]">
+                · {i18n.t("mandate.tradesPerDay", { count: dailyCap })}
+              </span>
+            )}
             {expires && (
               <span className="shrink-0 text-[10px] text-muted-foreground">
-                · expires {expires.toLocaleDateString()}
+                · {translateManifestKey("mandate.expiresOn", {
+                  date: expires.toLocaleDateString(i18n.resolvedLanguage || i18n.language),
+                })}
               </span>
             )}
           </span>
@@ -260,14 +313,18 @@ export const MandateProposalCard = memo(function MandateProposalCard({ proposal,
           )}
           <div className="min-w-0">
             <p className="text-sm font-semibold text-foreground">
-              {isReauth ? "Re-authorize connector mandate" : "Connector runtime mandate"}
+              {isReauth ? i18n.t("mandate.reauthMandate") : i18n.t("mandate.runtimeMandate")}
             </p>
             {proposal.intent_normalized && (
               <p className="text-xs text-muted-foreground">{proposal.intent_normalized}</p>
             )}
             {proposal.account && (
               <p className="mt-0.5 text-[11px] text-muted-foreground">
-                {proposal.account.broker} · {proposal.account.type} account · funded by {proposal.account.funded_by}
+                {translateManifestKey("mandate.accountSummary", {
+                  broker: proposal.account.broker,
+                  type: proposal.account.type,
+                  fundedBy: proposal.account.funded_by,
+                })}
               </p>
             )}
           </div>
@@ -282,14 +339,18 @@ export const MandateProposalCard = memo(function MandateProposalCard({ proposal,
               busy={busyOrdinal === profile.ordinal}
               disabled={busyOrdinal != null}
               adjusting={adjustingOrdinal === profile.ordinal}
-              onCommit={() => handleCommit(profile.ordinal)}
+              onCommit={() => setPendingOrdinal(profile.ordinal)}
               onAdjustToggle={() =>
                 setAdjustingOrdinal((cur) => (cur === profile.ordinal ? null : profile.ordinal))
               }
               onAdjustCancel={() => setAdjustingOrdinal(null)}
               onAdjustSubmit={(text) => {
                 setAdjustingOrdinal(null);
-                onAdjust(`For mandate proposal "${profile.label}" (option ${profile.ordinal}): ${text}`);
+                onAdjust(translateManifestKey("mandate.adjustRequestMessage", {
+                  label: profile.label,
+                  ordinal: profile.ordinal,
+                  text,
+                }));
               }}
             />
           ))}
@@ -310,6 +371,88 @@ export const MandateProposalCard = memo(function MandateProposalCard({ proposal,
           )}
         </div>
       </div>
+
+      <ConfirmDialog
+        open={pendingOrdinal != null}
+        title={i18n.t("mandate.confirmTitle")}
+        description={i18n.t("mandate.confirmDescription")}
+        confirmLabel={i18n.t("mandate.confirmButton")}
+        cancelLabel={i18n.t("mandate.cancel")}
+        tone="destructive"
+        confirmDisabled={!accountReady}
+        onCancel={() => {
+          setPendingOrdinal(null);
+          // A failed account read is retried the next time the dialog opens.
+          if (accountOptions.status === "error") setAccountOptions({ status: "idle" });
+        }}
+        onConfirm={() => {
+          const ordinal = pendingOrdinal;
+          if (ordinal == null || !accountReady) return;
+          setPendingOrdinal(null);
+          handleCommit(ordinal, accountRequired ? accountRef : "");
+        }}
+      >
+        {accountOptions.status === "loading" && (
+          <p className="mb-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            {i18n.t("mandate.accountLoading")}
+          </p>
+        )}
+        {accountOptions.status === "error" && (
+          <p role="alert" className="mb-2 break-words text-[11px] text-destructive">
+            {i18n.t("mandate.accountLoadFailed", { error: accountOptions.error })}
+          </p>
+        )}
+        {accountOptions.status === "ready" && accountOptions.required && (
+          <label className="mb-2 block text-[11px] text-muted-foreground">
+            {i18n.t("mandate.accountLabel")}
+            <select
+              value={accountRef}
+              onChange={(event) => setAccountRef(event.target.value)}
+              className="mt-1 w-full rounded-lg border bg-background px-2 py-1.5 text-xs text-foreground"
+            >
+              <option value="">{i18n.t("mandate.accountChoose")}</option>
+              {accountOptions.accounts.map((account) => {
+                const unusable = account.deactivated || !account.agentic_allowed;
+                return (
+                  <option key={account.account_ref} value={account.account_ref} disabled={unusable}>
+                    {account.label}
+                    {account.is_default ? i18n.t("mandate.accountDefault") : ""}
+                    {account.deactivated
+                      ? i18n.t("mandate.accountDeactivated")
+                      : !account.agentic_allowed
+                        ? i18n.t("mandate.accountNotAgentic")
+                        : ""}
+                  </option>
+                );
+              })}
+            </select>
+            <span className="mt-1 block">{i18n.t("mandate.accountHint")}</span>
+          </label>
+        )}
+        {pendingProfile && (
+          <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 rounded-lg border bg-muted/20 p-2.5 text-[11px]">
+            <div className="col-span-2">
+              <dt className="text-muted-foreground">{i18n.t("mandate.universe")}</dt>
+              <dd className="font-medium text-foreground">{formatUniverse(pendingProfile.universe)}</dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{i18n.t("mandate.maxOrder")}</dt>
+              <dd className="font-mono font-medium text-foreground">{formatUsd(pendingProfile.max_order_usd)}</dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{i18n.t("mandate.dailyCap")}</dt>
+              <dd className="font-mono font-medium text-foreground">
+                {i18n.t("mandate.tradesPerDay", { count: pendingProfile.daily_trade_cap })}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{i18n.t("mandate.leverage")}</dt>
+              <dd className="font-medium text-foreground">{formatLeverage(pendingProfile.leverage)}</dd>
+            </div>
+          </dl>
+        )}
+      </ConfirmDialog>
     </div>
   );
 });

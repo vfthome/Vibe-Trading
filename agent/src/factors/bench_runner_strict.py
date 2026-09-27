@@ -250,10 +250,12 @@ def categorise_strict(
         - ``alpha_t_train`` (Optional[float])  — None when no OOS split was run
         - ``alpha_t_test`` (Optional[float])   — None when no OOS split was run
         - ``ic_count`` (int)
+        - ``ic_count_train`` / ``ic_count_test`` (Optional[int]) — split
+          sample counts when OOS was run
 
     Rules:
         - ``alpha_t_full <= -thr``                          → ``reversed_strict``
-        - ``alpha_t_full >=  thr`` and (no OOS or ``alpha_t_test >= thr``)
+        - ``alpha_t_full >=  thr`` and (no OOS or both split t-stats pass)
                                                             → ``confirmed_alive``
         - ``alpha_t_full >=  thr`` and ``alpha_t_test <= -thr`` (OOS sign-flip)
                                                             → ``reversed_strict``
@@ -271,22 +273,38 @@ def categorise_strict(
         return "noise"
 
     t_full = row["alpha_t_full"]
+    t_train = row.get("alpha_t_train")
     t_test = row.get("alpha_t_test")
     thr = thresholds.alpha_t_threshold
+
+    if t_test is not None:
+        train_count = row.get("ic_count_train")
+        test_count = row.get("ic_count_test")
+        if (
+            train_count is None
+            or test_count is None
+            or train_count < thresholds.min_ic_count
+            or test_count < thresholds.min_ic_count
+        ):
+            return "noise"
 
     # Strict reversed: full sample alpha is significantly negative.
     if t_full <= -thr:
         return "reversed_strict"
 
     # Confirmed alive requires full-sample alpha_t > thr AND, when OOS was
-    # run, the test-period alpha must also clear thr (same sign as train).
+    # run, both train and test periods must independently clear the threshold.
     if t_full >= thr:
-        if t_test is None or t_test >= thr:
+        if t_test is None:
             return "confirmed_alive"
         # OOS sign-flip is the most diagnostic failure — treat as
         # reversed_strict, not train_only.
         if t_test <= -thr:
             return "reversed_strict"
+        if t_train is None or t_train < thr:
+            return "noise"
+        if t_test >= thr:
+            return "confirmed_alive"
         # Full sample passes but OOS sits in the noise band → train-only.
         return "train_only"
 
@@ -430,6 +448,15 @@ def run_bench_strict(
             oos_ts = pd.Timestamp(oos_split)
         except (TypeError, ValueError) as exc:
             return _finish_error(f"invalid oos_split {oos_split!r}: {exc}")
+        close = panel.get("close")
+        if close is not None and len(close.index):
+            first = pd.Timestamp(close.index.min())
+            last = pd.Timestamp(close.index.max())
+            if not first <= oos_ts < last:
+                return _finish_error(
+                    f"oos_split {oos_split!r} must fall within the loaded sample "
+                    f"[{first.date()}, {last.date()})"
+                )
 
     def _fire_progress(idx: int, aid: str) -> None:
         if on_progress is None:
@@ -478,6 +505,16 @@ def run_bench_strict(
                 alpha_t_test = t_stat(test_slice)
                 ic_count_train = int(len(train_slice))
                 ic_count_test = int(len(test_slice))
+                # t_stat reads fewer than two observations as 0.0, so an empty
+                # side would be categorised as if it had been measured. The
+                # sample-range check above cannot see this: the IC series
+                # starts after the alpha's warmup and ends a forward-return
+                # horizon before the last price.
+                if min(ic_count_train, ic_count_test) < 2:
+                    raise SkipAlpha(
+                        f"oos_split {oos_split} leaves {ic_count_train} train / "
+                        f"{ic_count_test} test IC observations; each side needs 2"
+                    )
 
             meta = reg.get(aid).meta or {}
             ic_mean = float(signal_ic.mean())

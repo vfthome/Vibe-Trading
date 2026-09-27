@@ -16,6 +16,7 @@ Security gates:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import sys
 import time
@@ -64,6 +65,7 @@ except Exception:  # pragma: no cover — rich is a project dep, fallback only
     TextColumn = None  # type: ignore[assignment]
     TimeElapsedColumn = None  # type: ignore[assignment]
 
+from src.factors.compare_runner import SORT_KEYS as _COMPARE_SORT_KEYS, compare_alphas
 from src.factors.registry import Registry, RegistryError
 
 
@@ -72,7 +74,40 @@ from src.factors.registry import Registry, RegistryError
 # We treat ``<repo>`` (and any subdirectory thereof) as the write-allow root.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
+# Benchmarkable data universes: every name here must have a panel loader in
+# ``src.tools.alpha_bench_tool._UNIVERSE_TAG``. There is no KRX (or NSE/BSE)
+# panel yet, so Korea/India are deliberately absent — ``alpha bench`` would
+# fail at universe load, not produce a Korean benchmark.
 _UNIVERSE_CHOICES = ["csi300", "sp500", "btc-usdt"]
+
+# Per-row fields that only ``bench_runner_strict`` produces. They are the
+# statistics ``categorise_strict`` actually gates on, so a strict run that
+# omits them reports a verdict the reader cannot check. Forwarded to both the
+# JSON envelope and the HTML report when present.
+_STRICT_ROW_FIELDS = (
+    "alpha_t_full",
+    "alpha_t_train",
+    "alpha_t_test",
+    "random_ic_mean",
+)
+
+# Factor-metadata universes accepted by ``alpha list --universe`` — these are
+# the values carried in each alpha's ``universe`` metadata, which is what
+# ``Registry.list`` filters on. Keep in sync with
+# ``src.factors.registry.Universe`` and the REST allowlist in
+# ``src.api.alpha_routes._VALID_UNIVERSES``.
+_LIST_UNIVERSE_CHOICES = [
+    "equity_us", "equity_cn", "equity_hk", "equity_in", "equity_kr",
+    "crypto", "futures",
+]
+# Benchmark universe -> the metadata universe its panel represents, so
+# ``alpha list --universe csi300`` keeps working (it used to filter on a name no
+# alpha carries and silently listed nothing). Mirrors the REST alias map.
+_LIST_UNIVERSE_ALIASES = {
+    "csi300": "equity_cn",
+    "sp500": "equity_us",
+    "btc-usdt": "crypto",
+}
 
 
 def _print(msg: str) -> None:
@@ -143,7 +178,10 @@ def cmd_alpha_list(args: argparse.Namespace) -> int:
     """
     try:
         reg = Registry()
-        ids = reg.list(zoo=args.zoo, theme=args.theme, universe=args.universe)
+        universe = args.universe
+        if universe is not None:
+            universe = _LIST_UNIVERSE_ALIASES.get(universe, universe)
+        ids = reg.list(zoo=args.zoo, theme=args.theme, universe=universe)
 
         limit = getattr(args, "limit", None)
         total = len(ids)
@@ -509,8 +547,21 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
     from ``src.tools.alpha_bench_tool`` (we do NOT modify that module).
     """
     try:
+        if (getattr(args, "oos_split", None) or getattr(args, "random_seeds", 5) != 5) and not getattr(args, "strict", False):
+            _err("alpha bench: --oos-split/--random-seeds only take effect with --strict.")
+            return 1
         try:
-            from src.factors.bench_runner import run_bench
+            if getattr(args, "strict", False):
+                from src.factors.bench_runner_strict import run_bench_strict
+
+                run_bench = functools.partial(
+                    run_bench_strict,
+                    random_control=True,
+                    n_random_seeds=max(1, int(getattr(args, "random_seeds", 5) or 5)),
+                    oos_split=getattr(args, "oos_split", None),
+                )
+            else:
+                from src.factors.bench_runner import run_bench
         except ImportError as exc:
             _err(f"alpha bench failed: bench_runner unavailable ({exc})")
             return 1
@@ -549,10 +600,17 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
             _err(f"alpha bench failed: no alphas registered under zoo={zoo!r}")
             return 1
 
+        strict_banner = (
+            " [strict: random control"
+            + (f", oos {args.oos_split}" if getattr(args, "oos_split", None) else "")
+            + "]"
+            if getattr(args, "strict", False)
+            else ""
+        )
         _print(
-            f"[bold]Bench:[/bold] {n_target} alphas x {args.universe} x {args.period}"
+            f"[bold]Bench:[/bold] {n_target} alphas x {args.universe} x {args.period}{strict_banner}"
             if _console
-            else f"Bench: {n_target} alphas x {args.universe} x {args.period}"
+            else f"Bench: {n_target} alphas x {args.universe} x {args.period}{strict_banner}"
         )
         _print(
             "[dim]ETA: ~3-5 min (cache hit) / ~10-20 min (cold fetch)[/dim]"
@@ -619,7 +677,7 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
         # Normalise rows + skipped for the report template (and for the JSON
         # envelope so consumers don't see the internal _category key).
         def _normalise_row(r: dict[str, Any]) -> dict[str, Any]:
-            return {
+            normalised = {
                 "id": r.get("id"),
                 "zoo": r.get("zoo") or _zoo_for_id(reg, r.get("id")),
                 "theme": r.get("theme") or [],
@@ -631,12 +689,24 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
                 "ic_count": r.get("ic_count", 0),
                 "category": r.get("_category") or r.get("category"),
             }
+            # Strict mode decides on the alpha t-stats and the random-control
+            # baseline, none of which survived this projection — so a strict
+            # run reported a category with no way to see the numbers behind
+            # it. Forward them when present; non-strict rows are unchanged.
+            for key in _STRICT_ROW_FIELDS:
+                if key in r:
+                    normalised[key] = r[key]
+            return normalised
 
         def _normalise_skipped(s: dict[str, Any]) -> dict[str, Any]:
             return {"alpha_id": s.get("id") or s.get("alpha_id"), "reason": s.get("reason", "")}
 
         top_rows = [_normalise_row(r) for r in top_rows_raw]
         failures_for_report = [_normalise_skipped(s) for s in skipped[:10]]
+        # Universe metadata (e.g. the sp500 loader's survivorship_bias flag),
+        # forwarded by bench_runner.run_bench as result["meta"] and already
+        # kept by alpha_routes._result_for_wire for the SSE/frontend path.
+        universe_meta = result.get("meta")
 
         report_path: Path | None = None
         try:
@@ -661,7 +731,10 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
                 "n_skipped": len(skipped),
                 "top": top_rows,
                 "failures": failures_for_report,
+                "strict": bool(getattr(args, "strict", False)),
             }
+            if universe_meta:
+                context["meta"] = universe_meta
             report_path.write_text(_render_html(context), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001 — report is nice-to-have
             _err(f"warning: could not write HTML report: {exc}")
@@ -677,6 +750,15 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
             "top": top_rows,
             "wall_seconds": result.get("wall_seconds"),
         }
+        if getattr(args, "strict", False):
+            envelope["strict"] = True
+            for key in ("confirmed_alive", "train_only", "reversed_strict", "noise"):
+                if key in result:
+                    envelope[key] = result[key]
+            if result.get("oos_split") is not None:
+                envelope["oos_split"] = result["oos_split"]
+        if universe_meta:
+            envelope["meta"] = universe_meta
         if report_path is not None:
             envelope["report_path"] = str(report_path)
         print(json.dumps(envelope, indent=2, default=str))
@@ -696,13 +778,43 @@ def cmd_alpha_bench(args: argparse.Namespace) -> int:
         return _handle_exception(args, "alpha bench failed", exc)
 
 
-def cmd_alpha_compare(args: argparse.Namespace) -> int:
-    """``vibe-trading alpha compare <id1> [<id2> ...] | --all | --zoo X``.
+def _render_compare_table(ranking: list[dict[str, Any]], sort_key: str) -> None:
+    """Print a head-to-head ranking table to stderr (nice-to-have, never fatal)."""
+    if _stderr_console is None or Table is None:
+        return
+    delta_key = f"delta_{sort_key}_vs_best"
+    table = Table(title=f"alpha compare — ranked by {sort_key}")
+    for col, justify in (
+        ("#", "right"), ("alpha", "left"), ("zoo", "left"), ("IC mean", "right"),
+        ("IC std", "right"), ("IR", "right"), ("IC>0", "right"), ("n", "right"),
+        (f"Δ {sort_key}", "right"),
+    ):
+        table.add_column(col, justify=justify)
+    for r in ranking:
+        table.add_row(
+            str(r["rank"]),
+            str(r["id"]),
+            str(r.get("zoo") or ""),
+            f"{r.get('ic_mean', 0.0):.4f}",
+            f"{r.get('ic_std', 0.0):.4f}",
+            f"{r.get('ir', 0.0):.4f}",
+            f"{r.get('ic_positive_ratio', 0.0):.3f}",
+            str(r.get("ic_count", 0)),
+            f"{r.get(delta_key, 0.0):+.4f}",
+        )
+    _stderr_console.print(table)
 
-    Stub for W4; reports validated targets so callers can wire scripts.
+
+def cmd_alpha_compare(args: argparse.Namespace) -> int:
+    """``vibe-trading alpha compare <id1> <id2> ... | --all | --zoo X``.
+
+    Bench a hand-picked set of alphas head-to-head and print a ranked
+    comparison (IC mean/std, IR, IC>0 ratio, sample count) plus a JSON
+    envelope. Only the named alphas are evaluated — the zoo-wide loop is
+    restricted via ``run_bench(only=...)`` — so comparing three alphas does
+    not bench all 191 in their zoo.
     """
     try:
-        targets: list[str]
         reg = Registry()
         if getattr(args, "compare_all", False):
             targets = reg.list()
@@ -711,20 +823,45 @@ def cmd_alpha_compare(args: argparse.Namespace) -> int:
         else:
             targets = list(args.alpha_ids or [])
 
+        # De-duplicate, preserving first-seen order.
+        seen: set[str] = set()
+        targets = [t for t in targets if not (t in seen or seen.add(t))]
+
         if not targets:
             _err(
                 "alpha compare: no targets supplied "
                 "(pass alpha ids, or --all for every alpha, or --zoo X to filter)"
             )
             return 1
+        if len(targets) < 2:
+            _err(
+                f"alpha compare: need at least 2 alphas to compare "
+                f"(got {len(targets)}: {', '.join(targets)})"
+            )
+            return 1
 
-        _print(f"compare targets ({len(targets)}): {', '.join(targets)}")
-        _print(
-            "[yellow]alpha compare not yet implemented (W4)[/yellow]"
-            if _console
-            else "alpha compare not yet implemented (W4)"
+        sort_key = getattr(args, "sort", "ir") or "ir"
+        envelope = compare_alphas(
+            targets, args.universe, args.period, sort=sort_key, registry=reg
         )
-        print(json.dumps({"status": "stub", "targets": targets, "reason": "W4 not implemented"}, indent=2))
+        print(json.dumps(envelope, indent=2, default=str))
+
+        if envelope.get("status") != "ok":
+            _err(f"alpha compare: {envelope.get('error', 'comparison failed')}")
+            return 1
+
+        ranking = envelope["ranking"]
+        _render_compare_table(ranking, sort_key)
+        summary = (
+            f"✓ Compared {envelope['n_compared']} alphas — winner: {envelope['winner']} "
+            f"({sort_key}={ranking[0].get(sort_key, 0.0):.4f})"
+        )
+        if envelope["n_skipped"]:
+            summary += f"; {envelope['n_skipped']} skipped"
+        if _stderr_console is not None:
+            _stderr_console.print(summary, style="green")
+        else:
+            print(summary, file=sys.stderr)
         return 0
     except Exception as exc:  # noqa: BLE001
         return _handle_exception(args, "alpha compare failed", exc)
@@ -813,8 +950,12 @@ def add_subparser(subparsers: Any) -> argparse.ArgumentParser:
     p_list.add_argument(
         "--universe",
         default=None,
-        choices=_UNIVERSE_CHOICES,
-        help=f"Filter by universe ({', '.join(_UNIVERSE_CHOICES)})",
+        choices=_LIST_UNIVERSE_CHOICES + _UNIVERSE_CHOICES,
+        help=(
+            "Filter by factor universe "
+            f"({', '.join(_LIST_UNIVERSE_CHOICES)}); the benchmark names "
+            f"({', '.join(_UNIVERSE_CHOICES)}) are accepted as aliases"
+        ),
     )
     p_list.add_argument(
         "--limit",
@@ -863,13 +1004,30 @@ def add_subparser(subparsers: Any) -> argparse.ArgumentParser:
     )
     p_bench.add_argument("--top", type=int, default=20, help="Top-N alphas to keep (default: 20)")
     p_bench.add_argument(
+        "--strict",
+        action="store_true",
+        help="Strict gate: mandatory same-universe random control (bench_runner_strict)",
+    )
+    p_bench.add_argument(
+        "--oos-split",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Strict mode only: split train/test at this date for the OOS confirmation gate",
+    )
+    p_bench.add_argument(
+        "--random-seeds",
+        type=int,
+        default=5,
+        help="Strict mode only: row-shuffled random controls per alpha (default: 5)",
+    )
+    p_bench.add_argument(
         "--yes",
         action="store_true",
         help="Skip the 'bench every alpha?' prompt when --zoo is omitted",
     )
 
-    p_compare = alpha_sub.add_parser("compare", help="Compare alphas (W4 stub)")
-    p_compare.add_argument("alpha_ids", nargs="*", help="Alpha ids to compare")
+    p_compare = alpha_sub.add_parser("compare", help="Compare alphas head-to-head")
+    p_compare.add_argument("alpha_ids", nargs="*", help="Alpha ids to compare (>= 2)")
     p_compare.add_argument(
         "--all",
         dest="compare_all",
@@ -880,6 +1038,23 @@ def add_subparser(subparsers: Any) -> argparse.ArgumentParser:
         "--zoo",
         default=None,
         help="Filter comparison to one zoo (e.g. alpha101)",
+    )
+    p_compare.add_argument(
+        "--universe",
+        default="csi300",
+        choices=_UNIVERSE_CHOICES,
+        help=f"Universe (default: csi300; one of {', '.join(_UNIVERSE_CHOICES)})",
+    )
+    p_compare.add_argument(
+        "--period",
+        default="2020-2025",
+        help="Period spec: YYYY-YYYY or YYYY-MM-DD/YYYY-MM-DD (e.g. 2020-2025)",
+    )
+    p_compare.add_argument(
+        "--sort",
+        default="ir",
+        choices=list(_COMPARE_SORT_KEYS),
+        help=f"Rank by which metric (default: ir; one of {', '.join(_COMPARE_SORT_KEYS)})",
     )
 
     p_export = alpha_sub.add_parser("export-manifest", help="Export registry manifest as JSON")

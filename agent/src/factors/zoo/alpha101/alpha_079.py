@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #79
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第79号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #79.
 
 Formula (paper appendix): rank(delta(IndNeutralize(0.607*close+0.393*open, sector), 1)) < rank(correlation(Ts_Rank(vwap,4), Ts_Rank(adv150,9), 15))
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['open', 'close', 'volume', 'vwap'],
     'extras_required': [],
     'requires_sector': True,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 172,
@@ -91,4 +98,6 @@ def compute(panel: dict) -> pd.DataFrame:
     lhs = rank(delta(ind_neutralize(mix, panel), 1))
     rhs = rank(ts_corr(ts_rank(vwap, 4), ts_rank(adv150, 9), 15))
     out = (lhs < rhs).astype(float)
-    return out
+    # Reach of each input through the nested windows; a gap inside it is not a verdict (#1463).
+    # volume: adv150 + ts_rank 9 + corr 15; vwap: ts_rank 4 + corr 15; close/open: delta 1.
+    return out.where(observed_over((volume, 172), (vwap, 18), (close, 2), (open_, 2)))

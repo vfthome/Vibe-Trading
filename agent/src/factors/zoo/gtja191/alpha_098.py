@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #98
+# 简要说明: 国泰君安191短周期交易型alpha因子第98号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha #98.
 
 Formula: ((((DELTA((SUM(CLOSE,100)/100),100)/DELAY(CLOSE,100))<0.05) || ((DELTA((SUM(CLOSE,100)/100),100)/DELAY(CLOSE,100))==0.05)) ? (-1*(CLOSE-TSMIN(CLOSE,100))) : (-1*DELTA(CLOSE,3)))
@@ -42,7 +48,8 @@ __alpha_meta__ = {
 def compute(panel: dict) -> pd.DataFrame:
     c = panel["close"]
     ma = ts_mean(c, 30)
-    cond_a = safe_div(delta(ma, 30), c.shift(30)) <= 0.05
+    drift = safe_div(delta(ma, 30), c.shift(30))
     branch1 = -1.0 * (c - ts_min(c, 30))
     branch2 = -1.0 * delta(c, 3)
-    return branch1.where(cond_a, branch2)
+    # An unknown drift selects neither branch; a NaN comparison is False, which picked branch2 (#1463).
+    return branch1.where(drift <= 0.05, branch2).where(drift.notna())

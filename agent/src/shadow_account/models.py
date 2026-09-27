@@ -9,6 +9,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+#: Deterministic price-context feature names shared across the pipeline.
+#: The extractor computes these as-of ``buy_dt``, codegen flattens their
+#: ``{min,max}`` bounds into the template, and the scanner evaluates them in
+#: real time. Defining the names here — on the stable data-contract boundary —
+#: keeps the three modules from drifting apart.
+PRICE_FEATURES: tuple[str, ...] = ("entry_rsi14", "prior_5d_return")
+
 
 @dataclass(frozen=True)
 class ShadowRule:
@@ -87,17 +94,24 @@ class AttributionBreakdown:
     late_exit_pnl: float
     overtrading_pnl: float
     counterfactual_trades: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    # Roundtrips settled in other currencies than the shadow pool's, kept out
+    # of the comparison (currency -> count). Empty for single-currency journals.
+    excluded_currencies: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ShadowBacktestResult:
-    """Output of multi-market shadow backtest + attribution."""
+    """Output of multi-market shadow backtest + attribution.
+
+    ``shadow_total_pnl``/``delta_pnl`` are None when the runner produced no
+    usable metrics; a failed comparison must never render as 0.0.
+    """
 
     shadow_id: str
     per_market: dict[str, dict[str, float]]
     combined: dict[str, float]
     equity_curves: dict[str, list[tuple[str, float]]]
     attribution: AttributionBreakdown
-    shadow_total_pnl: float
+    shadow_total_pnl: float | None
     real_total_pnl: float
-    delta_pnl: float
+    delta_pnl: float | None

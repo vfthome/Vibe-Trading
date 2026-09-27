@@ -1,4 +1,6 @@
-import { memo, useState, useCallback } from "react";
+import { useTranslation } from 'react-i18next';
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { X, Copy, Check, ExternalLink } from "lucide-react";
 
 interface Props {
@@ -7,7 +9,24 @@ interface Props {
 }
 
 export const PineScriptViewer = memo(function PineScriptViewer({ code, onClose }: Props) {
+  const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
+  const closeRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement;
+    closeRef.current?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (previouslyFocused instanceof HTMLElement) previouslyFocused.focus();
+    };
+  }, [onClose]);
 
   const handleCopy = useCallback(async () => {
     try {
@@ -27,16 +46,19 @@ export const PineScriptViewer = memo(function PineScriptViewer({ code, onClose }
     }
   }, [code]);
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("pineViewer.pineScript")}
         className="relative w-full max-w-3xl max-h-[80vh] mx-4 rounded-xl border bg-background shadow-2xl flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold">Pine Script v6</span>
+            <span className="text-sm font-semibold">{t("pineViewer.pineScript")}</span>
             <span className="text-xs text-muted-foreground">strategy.pine</span>
           </div>
           <div className="flex items-center gap-1.5">
@@ -45,7 +67,7 @@ export const PineScriptViewer = memo(function PineScriptViewer({ code, onClose }
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 transition-opacity"
             >
               {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-              {copied ? "Copied" : "Copy"}
+              {copied ? t("pineViewer.copied") : t("pineViewer.copy")}
             </button>
             <a
               href="https://www.tradingview.com/pine-script-docs/welcome/"
@@ -54,9 +76,12 @@ export const PineScriptViewer = memo(function PineScriptViewer({ code, onClose }
               className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground transition-colors"
             >
               <ExternalLink className="h-3 w-3" />
-              Docs
+              {t("pineViewer.docs")}
             </a>
             <button
+              ref={closeRef}
+              type="button"
+              aria-label={t("layout.cancel")}
               onClick={onClose}
               className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
             >
@@ -75,10 +100,11 @@ export const PineScriptViewer = memo(function PineScriptViewer({ code, onClose }
         {/* Footer */}
         <div className="px-4 py-2.5 border-t bg-muted/30">
           <p className="text-xs text-muted-foreground">
-            TradingView Pine Editor &rarr; New blank indicator &rarr; Paste code &rarr; Add to Chart
+            {t("pineViewer.footer")}
           </p>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 });

@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #3 - 条件量价反转
+# 简要说明: (-1 * CORR(RANK(OPEN), RANK(VOLUME), 10))，开盘价与成交量秩相关的负值。
+# 典型用途: 开盘量价关系异常识别，用于日内反转交易。
+# ============================================================
 """GTJA Alpha #3.
 
 Formula: SUM((CLOSE=DELAY(CLOSE,1)?0:CLOSE-(CLOSE>DELAY(CLOSE,1)?MIN(LOW,DELAY(CLOSE,1)):MAX(HIGH,DELAY(CLOSE,1)))),6)
@@ -49,4 +55,10 @@ def compute(panel: dict) -> pd.DataFrame:
     ref = pd.DataFrame(np.where(up, np.minimum(l, pc), np.where(dn, np.maximum(h, pc), c)),
                        index=c.index, columns=c.columns)
     move = (c - ref).where(up | dn, 0.0)
+    # A NaN comparison is False, not NaN, so a missing close/prior-close
+    # (a halt, a gap) reads the same as a real "unchanged" tie and gets
+    # the 0.0 above instead of NaN. Mask those back to NaN so the rolling
+    # sum's own min_periods correctly turns NaN for every window still
+    # touching the gap, instead of silently summing a fabricated 0.0.
+    move = move.mask(c.isna() | pc.isna())
     return move.rolling(6, min_periods=6).sum()

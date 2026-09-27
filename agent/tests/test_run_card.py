@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -115,7 +116,7 @@ def test_json_and_markdown_files_are_written(tmp_path: Path) -> None:
     markdown = md_path.read_text(encoding="utf-8")
 
     assert loaded == card
-    assert loaded["schema_version"] == "0.1"
+    assert loaded["schema_version"] == "1.0"
     assert loaded["generated_at"].endswith("Z")
     assert loaded["metrics"] == {"max_drawdown": -0.08, "sharpe": 1.23}
     assert loaded["validation"] == {"consistency_rate": 0.8, "n_windows": 5}
@@ -147,6 +148,106 @@ def test_api_run_response_includes_run_card(tmp_path: Path) -> None:
     response = api_server._build_response_from_run_dir(run_dir, elapsed=0.0)
 
     assert response.run_card == run_card
+
+
+def _write_chart_artifacts(run_dir: Path) -> None:
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    (run_dir / "state.json").write_text('{"status": "success"}\n', encoding="utf-8")
+    (run_dir / "req.json").write_text(
+        json.dumps({"context": {"codes": ["AAPL", "MSFT"], "start_date": "2025-01-01", "end_date": "2025-01-02"}}),
+        encoding="utf-8",
+    )
+    (artifacts / "price_series.csv").write_text(
+        "timestamp,code,open,high,low,close,volume\n"
+        "2025-01-01,AAPL,1,2,1,2,100\n"
+        "2025-01-01,MSFT,3,4,3,4,200\n",
+        encoding="utf-8",
+    )
+    (artifacts / "trades.csv").write_text(
+        "timestamp,code,side,price,qty,reason\n"
+        "2025-01-01,AAPL,BUY,2,10,entry\n"
+        "2025-01-01,MSFT,SELL,4,5,exit\n",
+        encoding="utf-8",
+    )
+
+
+def test_api_run_response_default_chart_payload_is_unchanged(tmp_path: Path) -> None:
+    import api_server
+
+    run_dir = tmp_path / "run_chart_default"
+    run_dir.mkdir()
+    _write_chart_artifacts(run_dir)
+
+    response = api_server._build_response_from_run_dir(run_dir, elapsed=0.0, include_analysis=True)
+    payload = response.model_dump()
+
+    assert "chart_symbols" not in payload
+    assert set(response.price_series or {}) == {"AAPL", "MSFT"}
+    assert {marker["code"] for marker in response.trade_markers or []} == {"AAPL", "MSFT"}
+
+
+def test_api_run_response_summary_chart_payload_discovers_symbols(tmp_path: Path) -> None:
+    import api_server
+
+    run_dir = tmp_path / "run_chart_summary"
+    run_dir.mkdir()
+    _write_chart_artifacts(run_dir)
+    chart_symbols: list[str] = []
+
+    response = api_server._build_response_from_run_dir(
+        run_dir,
+        elapsed=0.0,
+        include_analysis=True,
+        chart_payload="summary",
+        chart_symbols_out=chart_symbols,
+    )
+
+    assert chart_symbols == ["AAPL", "MSFT"]
+    assert response.price_series == {}
+    assert response.indicator_series == {}
+    assert response.trade_markers == []
+
+
+def test_api_run_response_can_filter_chart_symbol(tmp_path: Path) -> None:
+    import api_server
+
+    run_dir = tmp_path / "run_chart_symbol"
+    run_dir.mkdir()
+    _write_chart_artifacts(run_dir)
+    chart_symbols: list[str] = []
+
+    response = api_server._build_response_from_run_dir(
+        run_dir,
+        elapsed=0.0,
+        include_analysis=True,
+        chart_symbol="AAPL",
+        chart_symbols_out=chart_symbols,
+    )
+
+    assert chart_symbols == ["AAPL", "MSFT"]
+    assert set(response.price_series or {}) == {"AAPL"}
+    assert {marker["code"] for marker in response.trade_markers or []} == {"AAPL"}
+
+
+def test_api_run_response_includes_llm_usage(tmp_path: Path) -> None:
+    import api_server
+
+    run_dir = tmp_path / "run_001"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text('{"status": "success"}\n', encoding="utf-8")
+    llm_usage = {
+        "provider": "deepseek",
+        "model": "deepseek-v3.2",
+        "totals": {"input_tokens": 100, "output_tokens": 25, "total_tokens": 125, "calls": 1},
+        "per_iteration": [{"iter": 1, "input_tokens": 100, "output_tokens": 25, "total_tokens": 125}],
+        "updated_at": "2026-06-14T00:00:00Z",
+    }
+    (run_dir / "llm_usage.json").write_text(json.dumps(llm_usage), encoding="utf-8")
+
+    response = api_server._build_response_from_run_dir(run_dir, elapsed=0.0)
+
+    assert response.llm_usage == llm_usage
 
 
 def test_runner_artifact_spec_surfaces_run_card_paths() -> None:
@@ -196,15 +297,16 @@ def test_options_backtest_writes_run_card(tmp_path: Path) -> None:
                 },
             ]
 
-    run_options_backtest(
-        {
-            "codes": ["SPY"],
-            "start_date": "2025-01-01",
-            "end_date": "2025-01-06",
-            "source": "yfinance",
-            "engine": "options",
-            "initial_cash": 100_000,
-        },
+    config = {
+        "codes": ["SPY"],
+        "start_date": "2025-01-01",
+        "end_date": "2025-01-06",
+        "source": "yfinance",
+        "engine": "options",
+        "initial_cash": 100_000,
+    }
+    metrics = run_options_backtest(
+        config,
         FakeLoader(),
         SignalEngine(),
         tmp_path,
@@ -213,5 +315,83 @@ def test_options_backtest_writes_run_card(tmp_path: Path) -> None:
     card = json.loads((tmp_path / "run_card.json").read_text(encoding="utf-8"))
     assert card["backtest"]["engine"] == "options"
     assert card["data_sources"] == ["yfinance"]
+    assert len(card["tool_traces"]) == 1
+    assert card["tool_traces"][0]["tool"] == "backtest"
+    assert card["tool_traces"][0]["status"] == "ok"
+    started_at = datetime.fromisoformat(
+        card["tool_traces"][0]["started_at"].replace("Z", "+00:00")
+    )
+    ended_at = datetime.fromisoformat(
+        card["tool_traces"][0]["ended_at"].replace("Z", "+00:00")
+    )
+    assert started_at.tzinfo == timezone.utc
+    assert ended_at.tzinfo == timezone.utc
+    assert started_at <= ended_at
+    assert (
+        card["tool_traces"][0]["args_hash"]
+        == hashlib.sha256(
+            json.dumps(
+                config,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    assert (
+        card["tool_traces"][0]["result_hash"]
+        == hashlib.sha256(
+            json.dumps(
+                metrics,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    assert card["citations"]
+    assert all(
+        citation["artifact_id"] == "artifacts/metrics.csv"
+        for citation in card["citations"]
+    )
     assert "greeks.csv" in {Path(artifact["path"]).name for artifact in card["artifacts"]}
     assert (tmp_path / "run_card.md").exists()
+
+
+def test_api_run_response_includes_portfolio_studio_artifacts(tmp_path: Path) -> None:
+    import api_server
+
+    run_dir = tmp_path / "run_studio"
+    (run_dir / "artifacts").mkdir(parents=True)
+    (run_dir / "state.json").write_text('{"status": "success"}\n', encoding="utf-8")
+    risk_xray = {
+        "concentration": {"hhi": 0.25, "effective_n": 4.0},
+        "volatility": {"annualized_vol": 0.18},
+        "drawdown": {"max_drawdown": -0.12},
+    }
+    rebalance_notes = {
+        "rebalances": [{"date": "2026-01-05", "turnover": 0.4, "entries": [], "exits": [], "top_moves": []}],
+        "summary": {"target_change_count": 1, "turnover_total": 0.4, "turnover_mean": 0.4, "turnover_max": 0.4, "largest_rebalance_date": "2026-01-05"},
+    }
+    (run_dir / "artifacts" / "risk_xray.json").write_text(json.dumps(risk_xray), encoding="utf-8")
+    (run_dir / "artifacts" / "rebalance_notes.json").write_text(json.dumps(rebalance_notes), encoding="utf-8")
+
+    response = api_server._build_response_from_run_dir(run_dir, elapsed=0.0)
+
+    assert response.risk_xray == risk_xray
+    assert response.rebalance_notes == rebalance_notes
+
+
+def test_api_run_response_portfolio_studio_fields_none_when_absent(tmp_path: Path) -> None:
+    import api_server
+
+    run_dir = tmp_path / "run_plain"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text('{"status": "success"}\n', encoding="utf-8")
+
+    response = api_server._build_response_from_run_dir(run_dir, elapsed=0.0)
+
+    assert response.risk_xray is None
+    assert response.rebalance_notes is None

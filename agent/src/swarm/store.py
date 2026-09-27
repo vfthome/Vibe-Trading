@@ -15,8 +15,11 @@ import json
 import os
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from src.config.accessor import get_env_config
 
 from src.swarm.models import SwarmEvent, SwarmRun
 from src.tools.redaction import redact_internal_paths
@@ -69,7 +72,9 @@ def swarm_runs_root() -> Path:
     run_dir outside the allow-list (P03-A). Deriving it here once keeps
     the store location and the allow-list from drifting again.
     """
-    return Path(__file__).resolve().parents[2] / ".swarm" / "runs"
+    from src.config.paths import get_swarm_runs_dir
+
+    return get_swarm_runs_dir()
 
 
 _TRANSIENT_WINERRORS = (5, 32)  # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
@@ -136,8 +141,21 @@ class SwarmStore:
 
         Returns:
             Path to the run directory.
+
+        Raises:
+            ValueError: If run_id is empty, absolute, or path-shaped.
         """
-        return self.base_dir / run_id
+        candidate = Path(run_id)
+        if (
+            not run_id.strip()
+            or candidate.is_absolute()
+            or len(candidate.parts) != 1
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+            or "/" in run_id
+            or "\\" in run_id
+        ):
+            raise ValueError(f"run_id {run_id!r} must be a bare run directory name")
+        return self.base_dir / candidate.name
 
     def create_run(self, run: SwarmRun) -> Path:
         """Create the directory structure for a new run and write initial state.
@@ -314,10 +332,7 @@ class SwarmStore:
         Returns:
             Seconds of event silence after which the run should be reaped.
         """
-        try:
-            interval = float(os.getenv("SWARM_HEARTBEAT_INTERVAL_S", "3.0"))
-        except ValueError:
-            interval = 3.0
+        interval = get_env_config().swarm.swarm_heartbeat_interval_s
         heartbeat_floor = max(60.0, interval * 10.0)
 
         agent_budgets = [
@@ -439,7 +454,7 @@ class SwarmStore:
 
     def _reap_stale(self, run: SwarmRun, *, now: datetime) -> SwarmRun:
         """Pure: mark non-terminal tasks failed; derive run status from tasks."""
-        from src.swarm.models import RunStatus, TaskStatus
+        from src.swarm.models import TaskStatus
 
         terminal_task = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
         last_event_at = _last_event_timestamp(self.run_dir(run.id) / "events.jsonl")
@@ -545,7 +560,15 @@ class SwarmStore:
             path: Target file path.
             content: File content.
         """
-        tmp_path = path.with_suffix(".tmp")
+        # self._write_lock only serializes callers on this SwarmStore
+        # instance; mcp_server._get_swarm_store() builds a fresh instance
+        # per tool call, so two concurrent pollers of the same run each get
+        # their own lock. A shared ".tmp" name let one writer's rename
+        # consume the other's still-unwritten temp file, silently losing an
+        # update or raising FileNotFoundError. A per-write unique name keeps
+        # each writer's temp file private regardless of how many SwarmStore
+        # instances are racing.
+        tmp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
         with self._write_lock:
             tmp_path.write_text(content, encoding="utf-8")
             _replace_with_retry(tmp_path, path)

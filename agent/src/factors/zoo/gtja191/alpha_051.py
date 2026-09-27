@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #51 - 量价协方差排名
+# 简要说明: (-1*RANK(CORR(HIGH,MEAN(VOLUME,20),5))*RANK(CORR(CLOSE,MEAN(VOLUME,50),1)))，两种量价相关的排名乘积取负。
+# 典型用途: 不同时间尺度量价关系的综合反转信号。
+# ============================================================
 """GTJA Alpha #51.
 
 Formula: SUM(up_move,12)/(SUM(up_move,12)+SUM(dn_move,12))
@@ -49,8 +55,10 @@ def compute(panel: dict) -> pd.DataFrame:
                    np.abs(l.to_numpy() - l.shift(1).to_numpy())),
         index=h.index, columns=h.columns,
     )
-    up = move.where(hl > phl, 0.0)
-    dn = move.where(hl < phl, 0.0)
+    # A missing high/low today or yesterday is neither an up nor a down move (#1463).
+    valid = hl.notna() & phl.notna() & move.notna()
+    up = move.where(hl > phl, 0.0).where(valid)
+    dn = move.where(hl < phl, 0.0).where(valid)
     s_up = up.rolling(12, min_periods=12).sum()
     s_dn = dn.rolling(12, min_periods=12).sum()
     return safe_div(s_up, s_up + s_dn)

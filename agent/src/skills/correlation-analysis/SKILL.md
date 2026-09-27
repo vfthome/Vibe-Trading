@@ -239,7 +239,7 @@ def sector_clustering(
 ### Comparison of Three Linkage Methods
 
 | Method | Feature | Best Use Case | Weakness |
-|------|------|---------|------|
+|------|------|---------|--------|
 | Ward | Minimizes within-cluster variance, gives compact clusters | **Default recommendation**, stock-sector discovery | Works best for spherical clusters, weaker for irregular shapes |
 | Complete | Uses maximum pairwise distance, conservative | When high within-cluster similarity is required | Can produce elongated clusters |
 | Average | Uses average distance, compromise approach | General analysis where compactness is not the top priority | Sensitive to noise |
@@ -247,6 +247,9 @@ def sector_clustering(
 ---
 
 ## Mode 4: Realized Correlation
+
+> **Authoritative Source**: This section is the single source of truth for regime classification rules.
+> Other files (e.g., `agent/src/agent/context.py` Layer 3, `docs/trade-attribution-design.md`) reference this definition.
 
 **Use case**: Compute rolling correlation time series and analyze conditional correlation by market regime (bull / bear / high-volatility) to discover how correlation evolves dynamically.
 
@@ -280,8 +283,10 @@ def realized_correlation(
         rolling_corrs[f"roll_{w}d"] = df["y"].rolling(w).corr(df["x"])
 
     # Regime labels.
+    # N-day rolling mean (N = 252 for US equity; use 244 for A-share, 365 for crypto)
     bm_ret_252 = df["bm"].rolling(252).mean()
     bm_vol = df["bm"].rolling(vol_window).std()
+    # N-day rolling mean of volatility (N = 252 for US equity; use 244 for A-share, 365 for crypto)
     bm_vol_mean = bm_vol.rolling(252).mean()
 
     df["regime"] = "sideways"
@@ -306,6 +311,22 @@ def realized_correlation(
     }
 ```
 
+**Market-Adaptive Window (N)**:
+The rolling window for regime classification adapts to market type:
+- US equity: N = 252 (standard trading days per year)
+- A-share (China): N = 244 (fewer trading days due to holidays)
+- Crypto: N = 365 (24/7 market)
+
+The default value 252 in the function signature targets US equity.
+Callers for other markets should adjust the rolling windows accordingly.
+
+**Fallback for Short Data**:
+If available data length is shorter than N days (the market-equivalent annual window),
+regime classification falls back to fixed-threshold definitions:
+- Bull: cumulative benchmark return over the available period > +10%
+- Bear: cumulative benchmark return over the available period < -10%
+- High-vol / Sideways: not applicable in fallback mode
+
 ### Typical Correlation Behavior by Market Regime
 
 | Market Regime | Equity-Equity Correlation | Equity-Bond Correlation | A-Share Characteristic |
@@ -326,53 +347,48 @@ Correlation measures the degree of co-movement. Cointegration measures whether a
 Suitable for two-variable pairs, quick and intuitive.
 
 ```python
-from statsmodels.tsa.stattools import coint, adfuller
-import statsmodels.api as sm
-import numpy as np
+from src.quantlib.timeseries import adf_test, cointegration_test, find_hedge_ratio
 
 def engle_granger_coint(
     y: pd.Series,
     x: pd.Series,
     significance: float = 0.05,
 ) -> dict:
-    """Run the Engle-Granger two-step cointegration test.
+    """Run the Engle-Granger two-step cointegration test on one ordered pair.
 
     H0: No cointegration relationship exists (residuals contain a unit root).
+    Both steps come from the tested quantlib layer rather than a local OLS
+    fit: ``find_hedge_ratio`` estimates ``y = α + β·x`` (step 1) and
+    ``cointegration_test`` runs the Engle-Granger test itself (step 2).
 
     Args:
-        y, x: Two price series. These must be non-stationary series,
-            usually prices rather than returns.
+        y, x: Two price series sharing one index. These must be
+            non-stationary series, usually prices rather than returns.
         significance: Significance level
 
     Returns:
         Test results and spread series
     """
-    # Step 1: estimate the cointegrating vector with OLS.
-    x_const = sm.add_constant(x)
-    ols = sm.OLS(y, x_const).fit()
-    hedge_ratio = ols.params[x.name if x.name else "x"]
-    intercept = ols.params["const"]
-    residuals = ols.resid
-
-    # Step 2: test residual stationarity with ADF.
-    adf_res = adfuller(residuals, autolag="AIC")
-    adf_stat, adf_p = adf_res[0], adf_res[1]
-
-    # statsmodels coint wrapper.
-    coint_stat, coint_p, crit_vals = coint(y, x)
+    fit = find_hedge_ratio(y, x)
+    spread = y - fit["hedge_ratio"] * x - fit["intercept"]
+    coint = cointegration_test(y, x, significance=significance)
+    adf = adf_test(spread.dropna(), significance=significance)
 
     return {
         "method": "Engle-Granger",
-        "is_cointegrated": coint_p < significance,
-        "coint_p": round(coint_p, 6),
-        "coint_stat": round(coint_stat, 4),
-        "critical_values": {"1%": crit_vals[0], "5%": crit_vals[1], "10%": crit_vals[2]},
-        "hedge_ratio": round(hedge_ratio, 6),
-        "intercept": round(intercept, 6),
-        "spread": residuals,
-        "adf_on_spread": {"stat": round(adf_stat, 4), "p": round(adf_p, 6)},
+        "is_cointegrated": coint["is_cointegrated"],
+        "coint_p": round(coint["p_value"], 6),
+        "coint_stat": round(coint["test_statistic"], 4),
+        "critical_values": coint["critical_values"],
+        "hedge_ratio": round(fit["hedge_ratio"], 6),
+        "intercept": round(fit["intercept"], 6),
+        "half_life": fit["half_life"],
+        "spread": spread,
+        "adf_on_spread": {"stat": round(adf["adf_statistic"], 4), "p": round(adf["p_value"], 6)},
     }
 ```
+
+`find_hedge_ratio` and `cointegration_test` refuse two legs of different lengths or on different indices instead of zipping them positionally — inner-join the two price series on date before calling.
 
 **Note**: Engle-Granger can detect only one cointegrating vector, and the test result depends on the ordering of `y` and `x`. In practice, test both directions and keep the direction with the smaller p-value.
 
@@ -459,34 +475,16 @@ rank = k   → the series themselves are stationary, so cointegration is not nee
 Half-life measures how long a spread takes to mean-revert after deviating from equilibrium. It is a practical reference for expected holding period in pairs trading.
 
 ```python
-def compute_half_life(spread: pd.Series) -> float:
-    """Estimate mean-reversion half-life with OLS, in days.
+from src.quantlib.timeseries import compute_half_life
 
-    Principle:
-        Estimate ΔSpread_t = λ·Spread_{t-1} + ε
-        Half-life = -ln(2) / λ, where λ must be negative for mean reversion
-
-    Args:
-        spread: Spread series, which should be stationary
-
-    Returns:
-        Half-life in trading days. Negative or infinite values imply divergence.
-    """
-    spread_lag = spread.shift(1)
-    delta = spread.diff()
-    df = pd.concat([delta, spread_lag], axis=1).dropna()
-    df.columns = ["delta", "lag"]
-
-    x_const = sm.add_constant(df["lag"])
-    ols = sm.OLS(df["delta"], x_const).fit()
-    lam = ols.params["lag"]
-
-    if lam >= 0:
-        return float("inf")  # no mean reversion
-
-    half_life = -np.log(2) / lam
-    return round(half_life, 1)
+half_life = compute_half_life(spread)
+# Regresses ΔSpread_t on Spread_{t-1}; half-life = -ln(2) / λ, in observation
+# periods (trading days for daily bars). Returns inf when λ >= 0, i.e. the
+# spread does not mean-revert. Raises ValueError on fewer than 3 usable
+# lag/delta pairs or on a spread that never moves.
 ```
+
+`find_hedge_ratio` already reports this as `half_life`, so a pair screened through `engle_granger_coint` above carries it in its result.
 
 **Half-life reference ranges**:
 
@@ -686,11 +684,11 @@ def fx_adjusted_correlation(
         Raw correlation vs FX-adjusted correlation
     """
     # Domestic-currency foreign return = foreign return + FX return
-    foreign_ret = foreign_price.pct_change()
-    fx_ret = fx_rate.pct_change()
+    foreign_ret = foreign_price.pct_change(fill_method=None)
+    fx_ret = fx_rate.pct_change(fill_method=None)
     foreign_ret_cny = (1 + foreign_ret) * (1 + fx_ret) - 1
 
-    domestic_ret = domestic_price.pct_change()
+    domestic_ret = domestic_price.pct_change(fill_method=None)
 
     df = pd.concat([foreign_ret.rename("foreign_raw"),
                     foreign_ret_cny.rename("foreign_domestic"),
@@ -827,8 +825,8 @@ def generate_pair_signals(
         kf = kalman_hedge_ratio(y_price, x_price)
         spread = kf["spread"]
     else:
-        y_ret = y_price.pct_change()
-        x_ret = x_price.pct_change()
+        y_ret = y_price.pct_change(fill_method=None)
+        x_ret = x_price.pct_change(fill_method=None)
         res = bivariate_correlation_analysis(y_ret, x_ret, lookback)
         hedge_ratio = abs(res["beta"])
         spread = np.log(y_price) - hedge_ratio * np.log(x_price)

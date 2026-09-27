@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #129
+# 简要说明: 国泰君安191短周期交易型alpha因子第129号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha 129 (国泰君安 191 短周期交易型 alpha 因子, 2014).
 
 Formula (verbatim from the report):
@@ -55,5 +61,6 @@ def compute(panel):
     """
     c = panel["close"]
     dc = c - c.shift(1)
-    out = (-dc).where(dc < 0, 0.0).rolling(12).sum()
+    # A missing close change is not a zero loss (#1463).
+    out = (-dc).where(dc < 0, 0.0).where(dc.notna()).rolling(12).sum()
     return out

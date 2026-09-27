@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #58 - 均线偏离度
+# 简要说明: (-1*RANK(DELTA(MEAN(CLOSE,6),3))*RANK((CLOSE-MEAN(CLOSE,6))/MEAN(CLOSE,6)))，类似Alpha#53/#55。
+# 典型用途: 均线变化与偏离度的反转组合信号。
+# ============================================================
 """GTJA Alpha #58.
 
 Formula: COUNT(CLOSE>DELAY(CLOSE,1),20)/20*100
@@ -41,5 +47,6 @@ __alpha_meta__ = {
 
 def compute(panel: dict) -> pd.DataFrame:
     c = panel["close"]
-    up = (c > c.shift(1)).astype(float)
+    # A missing close or prior close is not a down day (#1463).
+    up = (c > c.shift(1)).astype(float).where(c.notna() & c.shift(1).notna())
     return up.rolling(20, min_periods=20).sum() / 20.0 * 100.0

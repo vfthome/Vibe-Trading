@@ -9,6 +9,7 @@ floors are exercised by monkeypatching the loader-backed helpers (no network).
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from src.live.mandate.model import (
     UniverseConstraint,
 )
 from src.tools.mcp import MCPRemoteToolSpec
+from tests import robinhood_mcp_helpers as rh
 
 
 # --------------------------------------------------------------------------- #
@@ -61,10 +63,10 @@ class _MockAdapter:
 
     def call_tool(self, remote_name: str, arguments: dict, *, local_name: str | None = None) -> dict:
         self.call_records.append({"remote": remote_name, "arguments": arguments})
-        if remote_name in ("get_positions", "list_positions"):
-            return {"positions": self._positions, "status": "ok"}
-        if remote_name in ("get_account", "get_balance", "get_buying_power"):
-            return {"equity": self._balance, "status": "ok"}
+        if remote_name == "get_equity_positions":
+            return rh.positions(self._positions)
+        if remote_name == "get_portfolio":
+            return rh.portfolio(total_value=str(self._balance))
         # The order placement itself (super().execute forwards here).
         self.order_calls.append({"remote": remote_name, "arguments": arguments})
         return {"status": "ok", "order_id": "rh_test_1", "state": "accepted"}
@@ -73,8 +75,8 @@ class _MockAdapter:
 def _spec() -> MCPRemoteToolSpec:
     return MCPRemoteToolSpec(
         server_name="robinhood",
-        remote_name="place_order",
-        local_name="mcp_robinhood_place_order",
+        remote_name="place_equity_order",
+        local_name="mcp_robinhood_place_equity_order",
         description="Place an order.",
         parameters={
             "type": "object",
@@ -174,7 +176,7 @@ def _check(intent: OrderIntent, mandate: Mandate, *, positions=None, daily_count
         positions if positions is not None else [],
         {"equity": 5000.0},
         broker="robinhood",
-        remote_tool="place_order",
+        remote_tool="place_equity_order",
         daily_count=daily_count,
     )
 
@@ -282,6 +284,51 @@ def test_guard_forwards_in_mandate_order(live_runtime: Path) -> None:
     assert counter["count"] == 1
 
 
+def test_mcp_guard_serializes_the_daily_cap_with_submission(live_runtime: Path) -> None:
+    """MCP placements share the same one-permit transaction as SDK orders."""
+    _write_mandate(live_runtime, _mandate(max_trades_per_day=1))
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingAdapter(_MockAdapter):
+        def call_tool(self, remote_name, arguments, *, local_name=None):
+            if remote_name in {"get_equity_positions", "get_portfolio"}:
+                return super().call_tool(remote_name, arguments, local_name=local_name)
+            self.order_calls.append({"remote": remote_name, "arguments": arguments})
+            entered.set()
+            assert release.wait(timeout=5)
+            return {"status": "ok", "order_id": "rh_test_1", "state": "accepted"}
+
+    adapter = _BlockingAdapter(positions=[], balance=5000.0)
+    guard = _guard(adapter)
+    outputs: list[dict[str, Any]] = []
+
+    def place() -> None:
+        outputs.append(
+            json.loads(
+                guard.execute(
+                    symbol="AAPL",
+                    side="buy",
+                    instrument_type="equity",
+                    notional_usd=100.0,
+                )
+            )
+        )
+
+    first = threading.Thread(target=place)
+    second = threading.Thread(target=place)
+    first.start()
+    assert entered.wait(timeout=2)
+    second.start()
+    second.join(timeout=1)
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert len(adapter.order_calls) == 1
+    assert sorted(output["status"] for output in outputs) == ["blocked", "ok"]
+
+
 def test_guard_blocks_over_notional_with_breach(live_runtime: Path) -> None:
     _write_mandate(live_runtime, _mandate())
     adapter = _MockAdapter(positions=[], balance=5000.0)
@@ -292,6 +339,77 @@ def test_guard_blocks_over_notional_with_breach(live_runtime: Path) -> None:
     assert out["requires_reauthorization"] is True
     assert out["breach"]["limit"] == "max_order_notional_usd"
     assert adapter.order_calls == []  # never forwarded
+
+
+def test_guard_blocks_opening_short_above_gross_exposure_cap(live_runtime: Path) -> None:
+    """A sell from zero opens short exposure; it does not reduce risk."""
+    _write_mandate(
+        live_runtime,
+        _mandate(
+            account_funding_usd=1000.0,
+            max_order_notional_usd=1000.0,
+            max_total_exposure_usd=500.0,
+            max_leverage=10.0,
+        ),
+    )
+    adapter = _MockAdapter(positions=[], balance=1000.0)
+    guard = _guard(adapter)
+
+    out = json.loads(
+        guard.execute(
+            symbol="AAPL",
+            side="sell",
+            instrument_type="equity",
+            notional_usd=600.0,
+        )
+    )
+
+    assert out["status"] == "blocked"
+    assert out["breach"]["limit"] == "max_total_exposure_usd"
+    assert out["breach"]["attempted_value"] == 600.0
+    assert adapter.order_calls == []
+
+
+def test_mixed_book_uses_gross_not_net_exposure() -> None:
+    mandate = _mandate(
+        account_funding_usd=1000.0,
+        max_order_notional_usd=1000.0,
+        max_total_exposure_usd=1000.0,
+        max_leverage=10.0,
+    )
+    positions = [
+        {"symbol": "MSFT", "quantity": 10.0, "price": 60.0},
+        {"symbol": "TSLA", "quantity": -10.0, "price": 50.0},
+    ]
+
+    breach = _check(
+        _intent(symbol="AAPL", side="buy", notional_usd=100.0),
+        mandate,
+        positions=positions,
+    )
+
+    assert breach is not None
+    assert breach.limit == "max_total_exposure_usd"
+    assert breach.attempted_value == 1200.0
+
+
+def test_sell_that_only_reduces_long_exposure_stays_allowed() -> None:
+    mandate = _mandate(
+        account_funding_usd=1000.0,
+        max_order_notional_usd=1000.0,
+        max_total_exposure_usd=500.0,
+        max_leverage=10.0,
+    )
+    positions = [{"symbol": "AAPL", "quantity": 10.0, "price": 60.0}]
+
+    assert (
+        _check(
+            _intent(symbol="AAPL", side="sell", notional_usd=200.0),
+            mandate,
+            positions=positions,
+        )
+        is None
+    )
 
 
 def test_guard_structural_breach_denies_no_reauth(live_runtime: Path) -> None:
@@ -357,10 +475,10 @@ class _FailingForwardAdapter:
         self.order_calls: list[dict[str, Any]] = []
 
     def call_tool(self, remote_name: str, arguments: dict, *, local_name: str | None = None) -> dict:
-        if remote_name == "get_positions":
-            return {"positions": [], "status": "ok"}
-        if remote_name == "get_account":
-            return {"equity": 5000.0, "status": "ok"}
+        if remote_name == "get_equity_positions":
+            return rh.positions([])
+        if remote_name == "get_portfolio":
+            return rh.portfolio()
         # The order placement fails at the broker.
         self.order_calls.append({"remote": remote_name, "arguments": arguments})
         return {"status": "error", "error": "broker rejected", "error_type": "BrokerError"}
@@ -427,7 +545,7 @@ def test_successful_forward_consumes_count_and_audits_accepted(live_runtime: Pat
 
 
 class _QuoteAdapter:
-    """Adapter with a working ``get_quotes`` read tool returning a fixed price."""
+    """Adapter with a working ``get_equity_quotes`` read tool returning a fixed price."""
 
     def __init__(self, *, price: float, positions: Any = (), balance: Any = 5000.0) -> None:
         self.server_name = "robinhood"
@@ -438,11 +556,11 @@ class _QuoteAdapter:
         self.quote_calls: list[dict[str, Any]] = []
 
     def call_tool(self, remote_name: str, arguments: dict, *, local_name: str | None = None) -> dict:
-        if remote_name == "get_positions":
-            return {"positions": self._positions, "status": "ok"}
-        if remote_name == "get_account":
-            return {"equity": self._balance, "status": "ok"}
-        if remote_name == "get_quotes":
+        if remote_name == "get_equity_positions":
+            return rh.positions(self._positions)
+        if remote_name == "get_portfolio":
+            return rh.portfolio(total_value=str(self._balance))
+        if remote_name == "get_equity_quotes":
             self.quote_calls.append({"arguments": arguments})
             return {"status": "ok", "symbol": arguments.get("symbol"), "price": self._price}
         self.order_calls.append({"remote": remote_name, "arguments": arguments})

@@ -7,7 +7,7 @@ is a plain function the API surface (``POST /mandate/commit``) calls when a user
 picks a profile. The agent loop has no reference to :func:`commit_mandate`, so
 even a compromised/hallucinating model cannot self-authorize a mandate — the
 only code path that writes one requires the surface-originated ``consent_ack``
-the model never produces (see ``docs/live-trading/SPEC.md`` §3 trust invariant,
+the model never produces (see the live-trading SPEC §3 trust invariant,
 Consent §1, Mandate §2). This is the 命门 invariant: a structural guarantee,
 not a prompt-level one.
 
@@ -30,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +47,41 @@ DEFAULT_MANDATE_LIFETIME_DAYS = 30
 _MANDATE_FILENAME = "mandate.json"
 _PROPOSALS_DIRNAME = "proposals"
 _CONSENT_DIRNAME = "consent"
+_PROPOSAL_ID_RE = re.compile(r"^mp_[0-9a-f]{32}$")
+
+def _is_real_number(value: Any) -> bool:
+    """Return whether ``value`` is a non-bool int/float."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+#: The leverage axis is the one clamped limit whose FLOOR is spelled as a word:
+#: ``"none"`` means cash only, and it is this module's own default
+#: (``leverage_raw = profile.get("leverage", "none")`` below). It is therefore
+#: not an "invalid non-numeric type" — it is the most conservative value on the
+#: axis, and it has to sort BELOW every number rather than fall into a
+#: fail-closed reject branch. Without this, narrowing 2x -> cash-only is refused
+#: while the equivalent 2x -> 1.0 is accepted, so the gate rejects the safest
+#: option a user can pick.
+_LEVERAGE_FLOOR_SENTINELS = ("none", None)
+
+
+def _normalize_leverage(value: Any) -> float | None:
+    """Return leverage as a comparable float, or ``None`` when it is not one.
+
+    Args:
+        value: Raw leverage from a profile, ceiling snapshot or adjustment.
+
+    Returns:
+        ``1.0`` for the cash-only sentinel, the value itself for a real
+        (non-bool) number, and ``None`` for anything else — a string like
+        ``"10"``, a bool, or any other type — so the caller fails closed.
+    """
+    if value is None or (isinstance(value, str) and value.strip().casefold() == "none"):
+        return 1.0
+    if _is_real_number(value):
+        return float(value)
+    return None
+
 
 #: Maps every accepted alias of a clamped limit to its CANONICAL name. The
 #: proposal profile, the ceiling snapshot, and the clamp in
@@ -150,6 +186,19 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _proposal_path(broker: str, proposal_id: str) -> Path:
+    """Return the contained proposal path for a valid opaque proposal id."""
+    if not _PROPOSAL_ID_RE.fullmatch(proposal_id):
+        raise ValueError("proposal_id must be a bare mp_<32 hex> identifier")
+    base = _proposals_dir(broker).resolve()
+    path = (base / f"{proposal_id}.json").resolve()
+    try:
+        path.relative_to(base)
+    except ValueError as exc:  # pragma: no cover - regex is the primary guard
+        raise ValueError("proposal_id escapes the proposals directory") from exc
+    return path
+
+
 # ---------------------------------------------------------------------------
 # PROPOSE state — proposal persistence (read-only; grants no authority)
 # ---------------------------------------------------------------------------
@@ -179,13 +228,17 @@ def save_proposal(proposal: Mapping[str, Any]) -> None:
     broker = str((proposal.get("account") or {}).get("broker") or "").strip()
     if not broker:
         raise ValueError("proposal must carry account.broker")
-    path = _proposals_dir(broker) / f"{proposal_id}.json"
+    path = _proposal_path(broker, proposal_id)
     _atomic_write_json(path, dict(proposal))
 
 
 def _load_proposal(broker: str, proposal_id: str) -> dict[str, Any] | None:
     """Load a persisted proposal, or ``None`` when absent/unreadable."""
-    path = _proposals_dir(broker) / f"{proposal_id}.json"
+    try:
+        path = _proposal_path(broker, proposal_id)
+    except ValueError as exc:
+        logger.warning("proposal %s for %s is invalid: %s", proposal_id, broker, exc)
+        return None
     if not path.is_file():
         return None
     try:
@@ -199,8 +252,8 @@ def _load_proposal(broker: str, proposal_id: str) -> dict[str, Any] | None:
 def _invalidate_proposal(broker: str, proposal_id: str) -> None:
     """Delete a proposal so it can never be committed twice (idempotency)."""
     try:
-        (_proposals_dir(broker) / f"{proposal_id}.json").unlink()
-    except FileNotFoundError:
+        _proposal_path(broker, proposal_id).unlink()
+    except (FileNotFoundError, ValueError):
         pass
 
 
@@ -243,12 +296,51 @@ def _resolve_profile(
             if key not in resolved:
                 raise CommitError(f"adjustment {key!r} is not a field of the selected profile")
             current = resolved[key]
-            if isinstance(current, (int, float)) and isinstance(value, (int, float)):
+            if key == "leverage" and (
+                current in _LEVERAGE_FLOOR_SENTINELS or value in _LEVERAGE_FLOOR_SENTINELS
+            ):
+                # Cash-only sits at the floor of this axis, so compare on the
+                # normalized scale instead of by type. Narrowing 2x -> "none"
+                # is the safest adjustment there is and must commit.
+                current_lev = _normalize_leverage(current)
+                new_lev = _normalize_leverage(value)
+                if current_lev is None or new_lev is None:
+                    raise CommitError(
+                        f"adjustment {key!r}={value!r} has an invalid type for the rendered limit "
+                        f"{current!r}; leverage narrowing requires a number or \"none\""
+                    )
+                if new_lev > current_lev:
+                    raise CommitError(
+                        f"adjustment {key!r}={value!r} widens the rendered limit {current!r}; "
+                        "widening must go through a fresh proposal"
+                    )
+            elif _is_real_number(current):
+                if not _is_real_number(value):
+                    raise CommitError(
+                        f"adjustment {key!r}={value!r} has an invalid type for the rendered limit "
+                        f"{current!r}; numeric narrowing requires an int or float"
+                    )
                 if value > current:
                     raise CommitError(
                         f"adjustment {key!r}={value} widens the rendered limit {current}; "
                         "widening must go through a fresh proposal"
                     )
+            elif isinstance(current, list):
+                if not isinstance(value, list):
+                    raise CommitError(
+                        f"adjustment {key!r}={value!r} has an invalid type for the rendered list "
+                        f"{current!r}; list narrowing requires a list subset"
+                    )
+                if not all(item in current for item in value):
+                    raise CommitError(
+                        f"adjustment {key!r}={value!r} widens the rendered whitelist {current!r}; "
+                        "widening must go through a fresh proposal"
+                    )
+            elif type(value) is not type(current) or value != current:
+                raise CommitError(
+                    f"adjustment {key!r}={value!r} changes the rendered value {current!r}; "
+                    "only narrowing or equivalent adjustments are allowed"
+                )
             resolved[key] = value
     return resolved
 
@@ -280,12 +372,27 @@ def _profile_fits_ceilings(profile: Mapping[str, Any], ceilings: Mapping[str, An
         if key not in prof:
             continue
         prof_value = prof[key]
-        if isinstance(ceiling_value, (int, float)) and isinstance(prof_value, (int, float)):
-            if prof_value > ceiling_value:
+        if key == "leverage":
+            # One scale for both sides: "none" is the floor (1.0), not a type
+            # error. A cash-only ceiling therefore still forbids any real
+            # leverage, and a cash-only PROFILE still fits a numeric ceiling.
+            ceiling_lev = _normalize_leverage(ceiling_value)
+            prof_lev = _normalize_leverage(prof_value)
+            if ceiling_lev is None or prof_lev is None:
                 return False
-        elif key == "leverage":
-            # Cash-only ceiling forbids any leverage other than "none".
-            if ceiling_value == "none" and prof_value not in ("none", None, 1, 1.0):
+            if prof_lev > ceiling_lev:
+                return False
+        elif key == "allowed_instruments":
+            # A whitelist may only be narrowed, never widened at commit time.
+            if not isinstance(ceiling_value, list) or not isinstance(prof_value, list):
+                return False
+            if not all(item in ceiling_value for item in prof_value):
+                return False
+        else:
+            # Numeric ceilings fail closed when either side is bool/non-numeric.
+            if not _is_real_number(ceiling_value) or not _is_real_number(prof_value):
+                return False
+            if prof_value > ceiling_value:
                 return False
     return True
 
@@ -394,8 +501,6 @@ def commit_mandate(
             "expires_at": expires_iso,
         },
     }
-    _atomic_write_json(broker_dir(broker) / _MANDATE_FILENAME, mandate_doc)
-
     consent_record = {
         "consent_record_id": consent_record_id,
         "mandate_id": mandate_id,
@@ -412,7 +517,11 @@ def commit_mandate(
         "created_at": created_iso,
         "expires_at": expires_iso,
     }
+    # Persist evidence before authority. If the consent write fails, no mandate
+    # becomes usable. If mandate publication fails afterward, the orphaned
+    # consent record is harmless and useful for audit/retry diagnosis.
     _atomic_write_json(_consent_dir(broker) / f"{consent_record_id}.json", consent_record)
+    _atomic_write_json(broker_dir(broker) / _MANDATE_FILENAME, mandate_doc)
 
     # One-shot: the proposal can never be committed again.
     _invalidate_proposal(broker, proposal_id)
@@ -433,6 +542,27 @@ def commit_mandate(
     }
 
 
+def _explicit_float(profile: Mapping[str, Any], key: str) -> float | None:
+    """Return ``profile[key]`` as a float, or ``None`` if absent or null.
+
+    ``_resolve_profile`` lets a commit-time adjustment narrow a numeric limit
+    down to an explicit ``0`` (any value <= the rendered limit is a legal
+    narrowing, the same path used for leverage="none"). Combining
+    ``profile.get(key, default)`` with Python's ``x or default`` idiom treats
+    that explicit ``0`` the same as "key missing" and silently substitutes a
+    higher fallback, which is exactly the widening a commit must never do.
+
+    Args:
+        profile: Resolved proposal profile.
+        key: Numeric limit to read.
+
+    Returns:
+        The explicit numeric value, including zero, or ``None`` if unspecified.
+    """
+    value = profile.get(key)
+    return float(value) if value is not None else None
+
+
 def _profile_to_hard_caps(profile: Mapping[str, Any]) -> dict[str, Any]:
     """Map a clamped proposal profile to the mandate ``hard_caps`` section.
 
@@ -450,11 +580,24 @@ def _profile_to_hard_caps(profile: Mapping[str, Any]) -> dict[str, Any]:
     leverage_raw = profile.get("leverage", "none")
     max_leverage = 1.0 if leverage_raw in ("none", None) else float(leverage_raw)
     instruments = list(profile.get("instruments") or ["equity"])
-    funding = float(profile.get("account_funding_usd", profile.get("max_total_exposure_usd", 0.0)) or 0.0)
-    max_order = float(profile.get("max_order_usd", 0.0) or 0.0)
-    max_exposure = float(profile.get("max_total_exposure_usd", funding or max_order) or max_order)
+
+    funding_val = _explicit_float(profile, "account_funding_usd")
+    exposure_val = _explicit_float(profile, "max_total_exposure_usd")
+    max_order = _explicit_float(profile, "max_order_usd")
+    if max_order is None:
+        max_order = 0.0
+
+    if exposure_val is not None:
+        max_exposure = exposure_val
+    elif funding_val is not None:
+        max_exposure = funding_val
+    else:
+        max_exposure = max_order
+
+    account_funding_usd = funding_val if funding_val is not None else max_exposure
+
     return {
-        "account_funding_usd": funding or max_exposure,
+        "account_funding_usd": account_funding_usd,
         "max_order_notional_usd": max_order,
         "max_total_exposure_usd": max_exposure,
         "max_leverage": max_leverage,

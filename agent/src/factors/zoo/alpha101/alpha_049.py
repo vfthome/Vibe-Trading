@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #49
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第49号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #49.
 
 Formula (paper appendix): (((delay(close,20)-delay(close,10))/10 - (delay(close,10)-close)/10) < -0.1) ? 1 : -1*(close-delay(close,1))
@@ -37,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 21,
@@ -90,4 +96,9 @@ def compute(panel: dict) -> pd.DataFrame:
     x = ((delay(close, 20) - delay(close, 10)) / 10.0) - ((delay(close, 10) - close) / 10.0)
     one = make_one(close)
     out = where_ternary(x < -0.1, one, -1.0 * (close - delay(close, 1)))
-    return out
+    # A NaN comparison is False, not NaN, so where_ternary's own
+    # np.isfinite safety net never fires here: the else branch only needs
+    # a 1-day delay and stays finite well before x's 20-day lookback is
+    # available, fabricating a signal during the declared warmup instead
+    # of NaN.
+    return out.where(x.notna())

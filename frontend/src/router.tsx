@@ -1,5 +1,5 @@
 import { Suspense, lazy, type ComponentType } from "react";
-import { createBrowserRouter } from "react-router-dom";
+import { createBrowserRouter } from "react-router";
 import { Layout } from "@/components/layout/Layout";
 
 const Home = lazy(() => import("@/pages/Home").then((m) => ({ default: m.Home })));
@@ -13,11 +13,26 @@ const Compare = lazy(() =>
 const Settings = lazy(() =>
   import("@/pages/Settings").then((m) => ({ default: m.Settings })),
 );
+const Runtime = lazy(() =>
+  import("@/pages/Runtime").then((m) => ({ default: m.Runtime })),
+);
+const Scheduled = lazy(() =>
+  import("@/pages/Scheduled").then((m) => ({ default: m.Scheduled })),
+);
+const Reports = lazy(() =>
+  import("@/pages/Reports").then((m) => ({ default: m.Reports })),
+);
+const Portfolio = lazy(() =>
+  import("@/pages/Portfolio").then((m) => ({ default: m.Portfolio })),
+);
 const Correlation = lazy(() =>
   import("@/pages/Correlation").then((m) => ({ default: m.Correlation })),
 );
 const AlphaZoo = lazy(() =>
   import("@/pages/AlphaZoo").then((m) => ({ default: m.AlphaZoo })),
+);
+const OptionsLab = lazy(() =>
+  import("@/pages/OptionsLab").then((m) => ({ default: m.OptionsLab })),
 );
 
 function PageLoader() {
@@ -40,14 +55,21 @@ export const router = createBrowserRouter([
   {
     element: <Layout />,
     children: [
-      { path: "/", element: wrap(Home) },
+      { path: "/", element: wrap(Agent) },
+      { path: "/about", element: wrap(Home) },
       { path: "/agent", element: wrap(Agent) },
+      { path: "/runtime", element: wrap(Runtime) },
+      { path: "/scheduled", element: wrap(Scheduled) },
+      { path: "/reports", element: wrap(Reports) },
+      { path: "/portfolio", element: wrap(Portfolio) },
       { path: "/settings", element: wrap(Settings) },
       { path: "/runs/:runId", element: wrap(RunDetail) },
       { path: "/compare", element: wrap(Compare) },
       { path: "/correlation", element: wrap(Correlation) },
+      { path: "/options", element: wrap(OptionsLab) },
       { path: "/alpha-zoo", element: wrap(AlphaZoo) },
       { path: "/alpha-zoo/bench", element: wrap(AlphaZoo) },
+      { path: "/alpha-zoo/compare", element: wrap(AlphaZoo) },
       { path: "/alpha-zoo/:alphaId", element: wrap(AlphaZoo) },
     ],
   },

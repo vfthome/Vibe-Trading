@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #24
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第24号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #24.
 
 Formula (paper appendix): complex piecewise; see paper
@@ -37,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 200,
@@ -93,4 +99,9 @@ def compute(panel: dict) -> pd.DataFrame:
     left = -1.0 * (close - ts_min(close, 100))
     right = -1.0 * delta(close, 3)
     out = where_ternary(cond, left, right)
-    return out
+    # A NaN comparison is False, not NaN, so where_ternary's own
+    # np.isfinite safety net never fires here: the else branch only
+    # needs a 3-day delta and stays finite well before x's 200-day
+    # lookback is available, fabricating a signal during warmup instead
+    # of NaN.
+    return out.where(x.notna())

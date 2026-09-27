@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #86
+# 简要说明: 国泰君安191短周期交易型alpha因子第86号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha #86.
 
 Formula: ((0.25 < (((DELAY(CLOSE,20)-DELAY(CLOSE,10))/10) - ((DELAY(CLOSE,10)-CLOSE)/10))) ? -1 : (((((DELAY(CLOSE,20)-DELAY(CLOSE,10))/10) - ((DELAY(CLOSE,10)-CLOSE)/10)) < 0) ? 1 : (-1*(CLOSE-DELAY(CLOSE,1)))))
@@ -48,4 +54,7 @@ def compute(panel: dict) -> pd.DataFrame:
     out = pd.DataFrame(np.where(0.25 < diff, -1.0,
                                 np.where(diff < 0, 1.0, last.to_numpy())),
                        index=c.index, columns=c.columns)
-    return out
+    # NaN comparisons are False, not NaN, so a gap that leaves diff
+    # undefined (warmup, or a halt inside the 10/20-day lookback) would
+    # otherwise fall through to the finite `last` branch instead of NaN.
+    return out.where(diff.notna())

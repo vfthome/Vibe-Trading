@@ -20,8 +20,21 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from src.config.accessor import get_env_config
+
 _ALLOWED_FILE_ROOTS_ENV = "VIBE_TRADING_ALLOWED_FILE_ROOTS"
 _ALLOWED_RUN_ROOTS_ENV = "VIBE_TRADING_ALLOWED_RUN_ROOTS"
+
+# MCP clients spawn the server themselves, so a shell export never reaches it.
+_ENV_SCOPE_HINT = (
+    "Under an MCP client, set it in that client's server env block — "
+    "exporting it in a shell does not reach the spawned server."
+)
+
+
+def _describe_roots(roots: list[Path]) -> str:
+    """Render allowed roots as an indented list for a rejection message."""
+    return "Allowed roots:\n" + "\n".join(f"  - {root}" for root in roots)
 
 
 def _rejects_unc(p: str) -> None:
@@ -34,7 +47,8 @@ def safe_path(p: str, workdir: Path) -> Path:
     """Resolve `p` under `workdir` and ensure it stays inside.
 
     Args:
-        p: User-supplied path (relative or absolute).
+        p: User-supplied path (relative or absolute).  ``~`` expansion is
+            supported so callers can pass home-relative paths.
         workdir: Workspace root. `p` must resolve to a location inside.
 
     Returns:
@@ -46,7 +60,13 @@ def safe_path(p: str, workdir: Path) -> Path:
     """
     _rejects_unc(p)
     base = Path(workdir).resolve()
-    resolved = (base / p).resolve()
+    # Expand ~ so home-relative paths (e.g. ~/.vibe-trading/scripts/foo.py)
+    # resolve correctly instead of being treated as literal directory names.
+    expanded = Path(p).expanduser()
+    if expanded.is_absolute():
+        resolved = expanded.resolve()
+    else:
+        resolved = (base / p).resolve()
     try:
         resolved.relative_to(base)
     except ValueError as exc:
@@ -61,7 +81,7 @@ def _agent_root() -> Path:
 
 def _configured_file_roots() -> list[Path]:
     """Return file roots configured through the environment."""
-    raw = os.getenv(_ALLOWED_FILE_ROOTS_ENV, "")
+    raw = get_env_config().api.vibe_trading_allowed_file_roots
     roots: list[Path] = []
     for item in raw.split(","):
         item = item.strip()
@@ -74,9 +94,12 @@ def _configured_file_roots() -> list[Path]:
 
 def _default_file_roots() -> list[Path]:
     """Return default roots for uploaded/imported user files."""
+    from src.config.paths import get_runtime_root
+
     cwd = Path.cwd().resolve()
     home = Path.home().resolve()
     agent_root = _agent_root()
+    runtime_root = get_runtime_root()
     return [
         agent_root / "uploads",
         agent_root / "runs",
@@ -84,25 +107,34 @@ def _default_file_roots() -> list[Path]:
         cwd / "data",
         home / ".vibe-trading" / "uploads",
         home / ".vibe-trading" / "imports",
+        runtime_root / "uploads",
+        runtime_root / "runs",
+        runtime_root / "imports",
     ]
 
 
 def _default_run_roots() -> list[Path]:
     """Return default roots for generated backtest/tool run directories."""
+    from src.config.paths import get_runtime_root
     from src.swarm.store import swarm_runs_root
 
     cwd = Path.cwd().resolve()
     home = Path.home().resolve()
     agent_root = _agent_root()
+    runtime_root = get_runtime_root()
     return [
         agent_root / "runs",
+        agent_root / ".swarm" / "runs",  # un-migrated legacy swarm runs
         swarm_runs_root(),
         cwd / "runs",
         home / ".vibe-trading" / "shadow_runs",
+        home / ".vibe-trading" / "runs",
+        runtime_root / "shadow_runs",
+        runtime_root / "runs",
     ]
 
 
-def _allowed_file_roots() -> list[Path]:
+def allowed_file_roots() -> list[Path]:
     """Return all roots allowed for document and broker-file reads."""
     roots: list[Path] = []
     for root in [*_default_file_roots(), *_configured_file_roots()]:
@@ -112,9 +144,105 @@ def _allowed_file_roots() -> list[Path]:
     return roots
 
 
+_ALLOWED_WRITE_ROOTS_ENV = "VIBE_TRADING_ALLOWED_WRITE_ROOTS"
+
+
+def allowed_write_roots() -> list[Path]:
+    """Return all roots allowed for file writes and edits."""
+    raw = get_env_config().api.vibe_trading_allowed_write_roots
+    configured: list[Path] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        _rejects_unc(item)
+        configured.append(Path(item).expanduser().resolve())
+
+    from src.config.paths import get_runtime_root
+
+    cwd = Path.cwd().resolve()
+    home = Path.home().resolve()
+    agent_root = _agent_root()
+    runtime_root = get_runtime_root()
+    defaults = [
+        agent_root / "uploads",
+        agent_root / "runs",
+        cwd / "uploads",
+        home / ".vibe-trading" / "uploads",
+        home / ".vibe-trading" / "runs",
+        runtime_root / "uploads",
+        runtime_root / "runs",
+    ]
+
+    roots: list[Path] = []
+    for root in [*defaults, *configured]:
+        resolved = root.resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def resolve_safe_path(
+    file_path: str,
+    run_dir: str | None,
+    allowed_roots: list[Path],
+    *,
+    purpose: str = "workspace",
+) -> Path:
+    """Resolve a file path under run_dir with fallback to allowed roots.
+
+    Args:
+        file_path: Relative or absolute path (supports tilde expansion).
+        run_dir: Optional run directory to resolve against.
+        allowed_roots: List of fallback allowed root directories.
+        purpose: Context name for error messages.
+
+    Returns:
+        Absolute resolved Path.
+
+    Raises:
+        ValueError: If path cannot be resolved or escapes boundaries.
+    """
+    _rejects_unc(file_path)
+
+    # Try resolving against run_dir if provided
+    if run_dir:
+        try:
+            run_root = safe_run_dir(run_dir)
+        except ValueError as exc:
+            # If safe_run_dir fails, check if the path is in allowed_roots first
+            candidate = Path(file_path).expanduser().resolve()
+            for root in allowed_roots:
+                if candidate.is_relative_to(root):
+                    return candidate
+            raise exc
+
+        try:
+            return safe_path(file_path, run_root)
+        except ValueError as exc:
+            # Fallback to allowed roots if safe_path containment fails
+            candidate = Path(file_path).expanduser().resolve()
+            for root in allowed_roots:
+                if candidate.is_relative_to(root):
+                    return candidate
+            raise ValueError(
+                f"Path {file_path!r} escapes run_dir {run_dir!r} and is not in allowed {purpose} roots."
+            ) from exc
+
+    # If no run_dir, path must resolve inside one of the allowed roots
+    candidate = Path(file_path).expanduser().resolve()
+    for root in allowed_roots:
+        if candidate.is_relative_to(root):
+            return candidate
+
+    raise ValueError(
+        f"run_dir is required to write/edit {file_path!r}, or the path must resolve inside allowed {purpose} roots."
+    )
+
+
 def _allowed_run_roots() -> list[Path]:
     """Return all roots allowed for run_dir-based tools."""
-    raw = os.getenv(_ALLOWED_RUN_ROOTS_ENV, "")
+    raw = get_env_config().api.vibe_trading_allowed_run_roots
     configured: list[Path] = []
     for item in raw.split(","):
         item = item.strip()
@@ -135,18 +263,20 @@ def _import_candidate(p: str) -> Path:
     """Return the filesystem candidate for an import path.
 
     Browser uploads are exposed as ``uploads/<name>`` so the UI never needs
-    a local absolute path. Resolve that handle back to the agent upload root
-    before enforcing the allowlist.
+    a local absolute path. Resolve that handle back to the user-level upload
+    root before enforcing the allowlist.
     """
+    from src.config.paths import get_uploads_dir
+
     candidate = Path(p).expanduser()
     if candidate.is_absolute():
         return candidate.resolve()
 
     parts = candidate.parts
     if parts and parts[0] == "uploads":
-        return (_agent_root() / candidate).resolve()
+        return (get_uploads_dir() / Path(*parts[1:])).resolve()
     if len(parts) >= 2 and parts[0] == "agent" and parts[1] == "uploads":
-        return (_agent_root() / Path(*parts[1:])).resolve()
+        return (get_uploads_dir() / Path(*parts[2:])).resolve()
     return (Path.cwd() / candidate).resolve()
 
 
@@ -167,13 +297,15 @@ def _safe_import_path(p: str, *, purpose: str) -> Path:
     _rejects_unc(p)
     resolved = _import_candidate(p)
 
-    for root in _allowed_file_roots():
+    roots = allowed_file_roots()
+    for root in roots:
         if resolved.is_relative_to(root):
             return resolved
 
     raise ValueError(
-        f"Path {p!r} is outside allowed {purpose} roots. "
-        f"Set {_ALLOWED_FILE_ROOTS_ENV} to add an import directory."
+        f"Path {p!r} is outside allowed {purpose} roots.\n"
+        f"{_describe_roots(roots)}\n"
+        f"Set {_ALLOWED_FILE_ROOTS_ENV} to add an import directory. {_ENV_SCOPE_HINT}"
     )
 
 
@@ -225,13 +357,15 @@ def safe_run_dir(p: str) -> Path:
     _rejects_unc(p)
     resolved = Path(p).expanduser().resolve()
 
-    for root in _allowed_run_roots():
+    roots = _allowed_run_roots()
+    for root in roots:
         if resolved.is_relative_to(root):
             return resolved
 
     raise ValueError(
-        f"run_dir {p!r} is outside allowed run roots. "
-        f"Set {_ALLOWED_RUN_ROOTS_ENV} to add a run directory."
+        f"run_dir {p!r} is outside allowed run roots.\n"
+        f"{_describe_roots(roots)}\n"
+        f"Set {_ALLOWED_RUN_ROOTS_ENV} to add a run directory. {_ENV_SCOPE_HINT}"
     )
 
 
@@ -257,9 +391,13 @@ def safe_run_id(run_id: str) -> Path:
     ):
         raise ValueError(f"run_id {run_id!r} must be a bare run directory name")
 
-    for root in _allowed_run_roots():
+    roots = _allowed_run_roots()
+    for root in roots:
         resolved = (root / candidate.name).resolve()
         if resolved.is_relative_to(root) and resolved.is_dir():
             return resolved
 
-    raise ValueError(f"run_id {run_id!r} was not found under allowed run roots")
+    raise ValueError(
+        f"run_id {run_id!r} was not found under allowed run roots.\n"
+        f"{_describe_roots(roots)}"
+    )

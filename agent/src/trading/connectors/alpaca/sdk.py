@@ -1,27 +1,45 @@
-"""Read-only Alpaca connector via the official ``alpaca-py`` SDK.
+"""Alpaca connector via the official ``alpaca-py`` SDK — with opt-in TAP routing.
 
-Wraps ``TradingClient`` (account/positions/orders) and
-``StockHistoricalDataClient`` (quote/bars) for the five read operations. No
-order-placement method is exposed here.
+Exposes the five reads (account/positions/orders via ``TradingClient``,
+quote/bars via ``StockHistoricalDataClient``) plus order placement and cancel.
 
-Paper-vs-live is structural: ``profile == "paper"`` constructs the client with
-``paper=True`` (host ``paper-api.alpaca.markets``) using the paper key pair; a
-live profile uses ``paper=False`` (host ``api.alpaca.markets``) with the live
-key pair. A paper key cannot reach the live host, so the configured profile —
-recorded as ``paper`` in every payload — is the authoritative discriminator.
+Credential isolation (opt-in): when TAP is configured (``TAP_PROXY_URL`` +
+``TAP_AGENT_KEY``), the **entire** broker egress — reads, order placement, and
+cancel — is routed through the TAP proxy instead of the SDK. Writes (place /
+cancel) block on human approval; reads are GETs that TAP auto-approves. The
+Alpaca secret then lives only in TAP (referenced by ``<CREDENTIAL:...>``
+placeholders, injected server-side), so the agent process holds no key and needs
+no ``alpaca-py``. With no TAP env the connector keeps its unchanged direct-SDK
+path.
+
+Paper-vs-live is structural: ``profile == "paper"`` uses host
+``paper-api.alpaca.markets`` and the paper key pair; a live profile uses
+``api.alpaca.markets`` and the live key pair. A paper key cannot reach the live
+host, so the configured profile — recorded as ``paper`` in every payload — is the
+authoritative discriminator.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
+from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping
+from urllib.parse import urlencode
 
 from src.config.paths import get_runtime_root
+from src.trading import tap_forward
 
 CONFIG_FILENAME = "alpaca.json"
+
+# Name of the TAP credential holding the Alpaca {key_id, secret_key} pair.
+# Overridable so a deployment can use a differently-named credential.
+TAP_ALPACA_CREDENTIAL_ENV = "TAP_ALPACA_CREDENTIAL"
+DEFAULT_TAP_ALPACA_CREDENTIAL = "alpaca"
 
 PROFILE_ENVIRONMENTS = {
     "paper": "paper",
@@ -31,6 +49,11 @@ PROFILE_ENVIRONMENTS = {
 
 PAPER_HOST = "https://paper-api.alpaca.markets"
 LIVE_HOST = "https://api.alpaca.markets"
+# Market-data API host (quote/bars). Same host for paper and live — only the
+# trading API splits paper/live — reached with the same key pair, so the one
+# ``alpaca`` TAP credential covers it (with ``data.alpaca.markets`` as a second
+# ``allowed_hosts`` entry).
+DATA_HOST = "https://data.alpaca.markets"
 
 
 class AlpacaDependencyError(RuntimeError):
@@ -158,6 +181,76 @@ def save_config(config: AlpacaConfig) -> Path:
     return path
 
 
+# ---------------------------------------------------------------------------
+# TAP routing (opt-in credential isolation)
+# ---------------------------------------------------------------------------
+
+# The REST market-data API abbreviates quote/bar keys where the alpaca-py models
+# expose full names; the mappers read the full names, so quote/bars responses
+# fetched via TAP are aliased back before mapping. The trading API (account /
+# positions / orders) already uses the full names, so it needs no aliasing.
+_QUOTE_KEY_ALIASES = {"bp": "bid_price", "ap": "ask_price", "bs": "bid_size", "as": "ask_size", "t": "timestamp"}
+_BAR_KEY_ALIASES = {"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
+
+
+def _tap_cred_headers() -> dict[str, str]:
+    """Placeholder headers TAP resolves server-side — never a raw key.
+
+    The one multi-secret ``alpaca`` credential (fields ``key_id`` + ``secret_key``)
+    backs both the order write and every read; the name is overridable via
+    ``TAP_ALPACA_CREDENTIAL``.
+    """
+    credential = os.environ.get(TAP_ALPACA_CREDENTIAL_ENV, DEFAULT_TAP_ALPACA_CREDENTIAL)  # noqa: env-gate — mirrors tap_forward.py, bootstrap-order independent
+    return {
+        "APCA-API-KEY-ID": f"<CREDENTIAL:{credential}.key_id>",
+        "APCA-API-SECRET-KEY": f"<CREDENTIAL:{credential}.secret_key>",
+    }
+
+
+def _read_via_tap(target: str) -> Any:
+    """GET ``target`` through the TAP proxy and return the parsed JSON body.
+
+    Reads are GET, which TAP auto-approves (no human step): this path is for
+    *credential isolation*, not gating — the agent process holds no Alpaca key,
+    TAP injects the secret from ``<CREDENTIAL:alpaca.*>`` placeholders server-side.
+    Fails closed: raises on any TAP/upstream error, mirroring the direct-SDK path
+    (which also raises on an API error), so read callers handle failure uniformly.
+    """
+    result = tap_forward.forward(target, "GET", None, _tap_cred_headers())
+    if not result.get("ok"):
+        reason = result.get("error") or result.get("decision") or "read not forwarded by TAP"
+        raise RuntimeError(f"TAP read failed: {reason}")
+    payload = result.get("body")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError as exc:
+            raise RuntimeError(f"TAP read returned a non-JSON body: {exc}") from exc
+    return payload
+
+
+def _rename_keys(item: Any, aliases: Mapping[str, str]) -> dict[str, Any]:
+    """Alias Alpaca market-data short keys to the model names the mappers expect
+    (``bp`` -> ``bid_price``, ``o`` -> ``open`` …); non-mappings become ``{}``."""
+    if not isinstance(item, Mapping):
+        return {}
+    out = dict(item)
+    for short, full in aliases.items():
+        if short in item:
+            out[full] = item[short]
+    return out
+
+
+def _rest_timeframe(period: str) -> str:
+    """Canonical period token -> Alpaca REST timeframe string (mirrors
+    :func:`_timeframe`). Case-sensitive: ``1m`` is one minute, ``1M`` one month."""
+    return {
+        "1m": "1Min", "5m": "5Min", "15m": "15Min", "30m": "30Min",
+        "1h": "1Hour", "1H": "1Hour", "4h": "4Hour", "4H": "4Hour",
+        "1w": "1Week", "1W": "1Week", "1M": "1Month",
+    }.get(period.strip(), "1Day")
+
+
 def alpaca_available() -> bool:
     """Return whether the optional ``alpaca-py`` SDK can be imported."""
     try:
@@ -174,6 +267,7 @@ def check_status(config: AlpacaConfig | None = None) -> dict[str, Any]:
         "status": "ok",
         "config": _public_config(cfg),
         "sdk": {"package": "alpaca-py", "installed": alpaca_available()},
+        "tap": tap_forward.tap_enabled(),
         "paper_guard": "host_separated",
         "host": cfg.host,
     }
@@ -184,7 +278,7 @@ def check_status(config: AlpacaConfig | None = None) -> dict[str, Any]:
         report["error"] = f"Alpaca connector not configured: missing {', '.join(missing)}."
         return report
 
-    if not report["sdk"]["installed"]:
+    if not tap_forward.tap_enabled() and not report["sdk"]["installed"]:
         report["status"] = "error"
         report["error"] = "Optional dependency missing: install with `pip install alpaca-py`."
         return report
@@ -207,8 +301,10 @@ def check_status(config: AlpacaConfig | None = None) -> dict[str, Any]:
 def get_account_snapshot(config: AlpacaConfig | None = None) -> dict[str, Any]:
     """Fetch account summary for the configured account."""
     cfg = config or load_config()
-    client = _trading_client(cfg)
-    account = client.get_account()
+    if tap_forward.tap_enabled():
+        account = _read_via_tap(f"{cfg.host}/v2/account")
+    else:
+        account = _trading_client(cfg).get_account()
     return {
         "status": "ok",
         "profile": cfg.profile,
@@ -231,8 +327,10 @@ def get_account_snapshot(config: AlpacaConfig | None = None) -> dict[str, Any]:
 def get_positions(config: AlpacaConfig | None = None) -> dict[str, Any]:
     """Fetch current positions for the configured account."""
     cfg = config or load_config()
-    client = _trading_client(cfg)
-    positions = client.get_all_positions()
+    if tap_forward.tap_enabled():
+        positions = _read_via_tap(f"{cfg.host}/v2/positions")
+    else:
+        positions = _trading_client(cfg).get_all_positions()
     rows = [_position_to_dict(item) for item in _as_iter(positions)]
     return {"status": "ok", "profile": cfg.profile, "is_paper": cfg.is_paper, "positions": rows}
 
@@ -240,13 +338,21 @@ def get_positions(config: AlpacaConfig | None = None) -> dict[str, Any]:
 def get_open_orders(config: AlpacaConfig | None = None, *, include_executions: bool = False) -> dict[str, Any]:
     """Fetch open orders and, optionally, recently filled orders."""
     cfg = config or load_config()
-    client = _trading_client(cfg)
-    _require_alpaca()
-    from alpaca.trading.requests import GetOrdersRequest  # type: ignore
-    from alpaca.trading.enums import QueryOrderStatus  # type: ignore
+    if tap_forward.tap_enabled():
+        open_orders = _read_via_tap(f"{cfg.host}/v2/orders?status=open")
+        closed = _read_via_tap(f"{cfg.host}/v2/orders?status=closed") if include_executions else []
+    else:
+        client = _trading_client(cfg)
+        _require_alpaca()
+        from alpaca.trading.requests import GetOrdersRequest  # type: ignore
+        from alpaca.trading.enums import QueryOrderStatus  # type: ignore
 
-    open_req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-    open_orders = client.get_orders(filter=open_req)
+        open_orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+        closed = (
+            client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED))
+            if include_executions
+            else []
+        )
     result: dict[str, Any] = {
         "status": "ok",
         "profile": cfg.profile,
@@ -254,22 +360,53 @@ def get_open_orders(config: AlpacaConfig | None = None, *, include_executions: b
         "open_orders": [_order_to_dict(item) for item in _as_iter(open_orders)],
     }
     if include_executions:
-        closed_req = GetOrdersRequest(status=QueryOrderStatus.CLOSED)
-        closed = client.get_orders(filter=closed_req)
-        result["executions"] = [_order_to_dict(item) for item in _as_iter(closed) if _obj_get(item, "filled_qty")]
+        result["executions"] = [
+            _order_to_dict(item) for item in _as_iter(closed) if _obj_get(item, "filled_qty")
+        ]
     return result
+
+
+def get_order_by_client_order_id(
+    config: AlpacaConfig | None = None, *, client_order_id: str
+) -> dict[str, Any]:
+    """Read one order by the caller-owned exact Alpaca client order ID."""
+    cfg = config or load_config()
+    client_id = str(client_order_id or "").strip()
+    if not (1 <= len(client_id) <= 48):
+        return {"status": "error", "error": "client_order_id must contain 1-48 characters"}
+    try:
+        if tap_forward.tap_enabled():
+            query = urlencode({"client_order_id": client_id})
+            order = _read_via_tap(f"{cfg.host}/v2/orders:by_client_order_id?{query}")
+        else:
+            order = _trading_client(cfg).get_order_by_client_id(client_id)
+    except Exception as exc:  # noqa: BLE001 - read failure is insufficient evidence
+        return {"status": "error", "error": str(exc)}
+    item = _order_to_dict(order)
+    return {"status": "ok", "profile": cfg.profile, "is_paper": cfg.is_paper, "order": {
+        "broker_order_id": item["order_id"], "client_order_id": item["client_order_id"],
+        "symbol": item["symbol"], "side": item["side"], "order_type": item["order_type"],
+        "time_in_force": item["time_in_force"], "quantity": item["quantity"],
+        "notional": item["notional"], "limit_price": item["limit_price"],
+        "filled_qty": item["filled_qty"], "order_status": item["status"],
+        "submitted_at": item["submitted_at"],
+    }}
 
 
 def get_quote(symbol: str, *, config: AlpacaConfig | None = None, **_: Any) -> dict[str, Any]:
     """Fetch a latest quote snapshot for ``symbol``."""
     cfg = config or load_config()
-    client = _data_client(cfg)
-    from alpaca.data.requests import StockLatestQuoteRequest  # type: ignore
-
     clean = symbol.strip().upper()
-    req = StockLatestQuoteRequest(symbol_or_symbols=clean, feed=_data_feed(cfg))
-    quotes = client.get_stock_latest_quote(req)
-    quote = quotes.get(clean) if isinstance(quotes, Mapping) else _obj_get(quotes, clean)
+    if tap_forward.tap_enabled():
+        payload = _read_via_tap(f"{DATA_HOST}/v2/stocks/{clean}/quotes/latest?feed={cfg.feed}")
+        quote: Any = _rename_keys(_obj_get(payload, "quote"), _QUOTE_KEY_ALIASES)
+    else:
+        client = _data_client(cfg)
+        from alpaca.data.requests import StockLatestQuoteRequest  # type: ignore
+
+        req = StockLatestQuoteRequest(symbol_or_symbols=clean, feed=_data_feed(cfg))
+        quotes = client.get_stock_latest_quote(req)
+        quote = quotes.get(clean) if isinstance(quotes, Mapping) else _obj_get(quotes, clean)
     return {
         "status": "ok",
         "symbol": clean,
@@ -293,15 +430,23 @@ def get_historical_bars(
 ) -> dict[str, Any]:
     """Fetch historical bars for ``symbol`` (``period`` is a canonical token)."""
     cfg = config or load_config()
-    client = _data_client(cfg)
-    from alpaca.data.requests import StockBarsRequest  # type: ignore
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit  # type: ignore
-
     clean = symbol.strip().upper()
-    timeframe = _timeframe(period, TimeFrame, TimeFrameUnit)
-    req = StockBarsRequest(symbol_or_symbols=clean, timeframe=timeframe, limit=int(limit), feed=_data_feed(cfg))
-    bars = client.get_stock_bars(req)
-    rows = bars.data.get(clean, []) if hasattr(bars, "data") else _as_iter(bars)
+    if tap_forward.tap_enabled():
+        url = (
+            f"{DATA_HOST}/v2/stocks/{clean}/bars"
+            f"?timeframe={_rest_timeframe(period)}&limit={int(limit)}&feed={cfg.feed}"
+        )
+        payload = _read_via_tap(url)
+        rows: Any = [_rename_keys(item, _BAR_KEY_ALIASES) for item in _as_iter(_obj_get(payload, "bars") or [])]
+    else:
+        client = _data_client(cfg)
+        from alpaca.data.requests import StockBarsRequest  # type: ignore
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit  # type: ignore
+
+        timeframe = _timeframe(period, TimeFrame, TimeFrameUnit)
+        req = StockBarsRequest(symbol_or_symbols=clean, timeframe=timeframe, limit=int(limit), feed=_data_feed(cfg))
+        bars = client.get_stock_bars(req)
+        rows = bars.data.get(clean, []) if hasattr(bars, "data") else _as_iter(bars)
     return {
         "status": "ok",
         "symbol": clean,
@@ -320,6 +465,7 @@ def place_order(
     order_type: str = "market",
     limit_price: float | None = None,
     time_in_force: str = "day",
+    client_order_id: str | None = None,
 ) -> dict[str, Any]:
     """Submit an order to the configured Alpaca account.
 
@@ -338,6 +484,7 @@ def place_order(
         order_type: ``market`` or ``limit``.
         limit_price: Required when ``order_type`` is ``limit``.
         time_in_force: ``day`` or ``gtc``.
+        client_order_id: Optional caller-owned exact order identity.
 
     Returns:
         On success ``{"status": "ok", "order_id", "symbol", "side", "profile",
@@ -363,6 +510,10 @@ def place_order(
     tif_token = str(time_in_force or "").strip().lower()
     if tif_token not in ("day", "gtc"):
         return {"status": "error", "error": "time_in_force must be 'day' or 'gtc'"}
+
+    client_id = str(client_order_id).strip() if client_order_id is not None else None
+    if client_id is not None and not (1 <= len(client_id) <= 48):
+        return {"status": "error", "error": "client_order_id must contain 1-48 characters"}
 
     has_qty = quantity is not None
     has_notional = notional is not None
@@ -394,6 +545,23 @@ def place_order(
         if limit_value <= 0:
             return {"status": "error", "error": "limit_price must be positive"}
 
+    # Credential isolation (opt-in): when TAP is configured, route the order
+    # through the TAP proxy — human-approved, with the broker secret injected
+    # server-side — instead of the local Alpaca SDK. No TAP env => unchanged
+    # direct-SDK path below. All input validation above still applies.
+    if tap_forward.tap_enabled():
+        return _submit_via_tap(
+            cfg,
+            symbol=clean_symbol,
+            side=side_token,
+            quantity=qty_value,
+            notional=notional_value,
+            order_type=type_token,
+            limit_price=limit_value,
+            time_in_force=tif_token,
+            client_order_id=client_id,
+        )
+
     try:
         client = _trading_client(cfg)
         from alpaca.trading.enums import OrderSide, TimeInForce  # type: ignore
@@ -405,6 +573,7 @@ def place_order(
         order_side = OrderSide.BUY if side_token == "buy" else OrderSide.SELL
         tif = TimeInForce.DAY if tif_token == "day" else TimeInForce.GTC
         amount = {"qty": qty_value} if has_qty else {"notional": notional_value}
+        identity = {"client_order_id": client_id} if client_id is not None else {}
 
         if type_token == "limit":
             req = LimitOrderRequest(
@@ -413,6 +582,7 @@ def place_order(
                 time_in_force=tif,
                 limit_price=limit_value,
                 **amount,
+                **identity,
             )
         else:
             req = MarketOrderRequest(
@@ -420,6 +590,7 @@ def place_order(
                 side=order_side,
                 time_in_force=tif,
                 **amount,
+                **identity,
             )
 
         order = client.submit_order(order_data=req)
@@ -431,6 +602,7 @@ def place_order(
     return {
         "status": "ok",
         "order_id": str(_obj_get(order, "id", "")),
+        "client_order_id": str(_obj_get(order, "client_order_id", "")),
         "symbol": clean_symbol,
         "side": side_token,
         "profile": cfg.profile,
@@ -442,6 +614,98 @@ def place_order(
         "limit_price": limit_value,
         "order_status": str(_obj_get(order, "status", "")),
         "filled_qty": _obj_get(order, "filled_qty"),
+    }
+
+
+def _submit_via_tap(
+    cfg: AlpacaConfig,
+    *,
+    symbol: str,
+    side: str,
+    quantity: float | None,
+    notional: float | None,
+    order_type: str,
+    limit_price: float | None,
+    time_in_force: str,
+    client_order_id: str | None,
+) -> dict[str, Any]:
+    """Place the order through the TAP proxy instead of the Alpaca SDK.
+
+    The agent process holds no Alpaca secret on this path: the order is POSTed to
+    TAP ``/forward`` with ``<CREDENTIAL:alpaca.key_id>`` / ``.secret_key``
+    placeholders, which TAP injects into the ``APCA-API-*`` headers server-side
+    after a human approves. The upstream host is the connector's own
+    ``cfg.host`` (operator-controlled, not agent-controlled), and the TAP
+    credential's ``allowed_hosts`` pins it — a tampered target is rejected before
+    injection. Returns the same envelope as the direct-SDK path, so the paper
+    path and the live mandate gate are unchanged.
+    """
+    order: dict[str, Any] = {
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "time_in_force": time_in_force,
+    }
+    if quantity is not None:
+        order["qty"] = str(quantity)
+    else:
+        order["notional"] = str(notional)
+    if order_type == "limit":
+        order["limit_price"] = str(limit_price)
+
+    # Idempotency: a deterministic client_order_id derived from the order
+    # content, so a retry after an approval-race / poll timeout (where TAP
+    # forwarded the order but the agent saw a timeout) is deduplicated by Alpaca
+    # — a duplicate id is rejected, never double-placed. Trade-off: two
+    # intentionally-identical orders collide; vary any field for a real duplicate.
+    order["client_order_id"] = client_order_id or (
+        "tap-" + hashlib.sha256(
+            "|".join(
+                str(x)
+                for x in (cfg.profile, symbol, side, quantity, notional, order_type, limit_price, time_in_force)
+            ).encode()
+        ).hexdigest()[:24]
+    )
+
+    cred_headers = _tap_cred_headers()
+    target = f"{cfg.host}/v2/orders"
+
+    result = tap_forward.forward(target, "POST", json.dumps(order), cred_headers)
+
+    if not result.get("ok"):
+        decision = result.get("decision")
+        reason = result.get("error") or {
+            "denied": "order denied by approver",
+            "timeout": "approval timed out",
+            "timed_out": "approval timed out",
+        }.get(decision, "order not forwarded by TAP")
+        return {"status": "error", "error": f"TAP: {reason}", "tap_decision": decision}
+
+    payload = result.get("body")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    return {
+        "status": "ok",
+        "order_id": str(payload.get("id", "")),
+        "client_order_id": str(payload.get("client_order_id", "")),
+        "symbol": symbol,
+        "side": side,
+        "profile": cfg.profile,
+        "is_paper": cfg.is_paper,
+        "order_type": order_type,
+        "time_in_force": time_in_force,
+        "quantity": quantity,
+        "notional": notional,
+        "limit_price": limit_price,
+        "order_status": str(payload.get("status", "")),
+        "filled_qty": payload.get("filled_qty"),
+        "via": "tap",
     }
 
 
@@ -470,6 +734,14 @@ def cancel_order(
     if not clean_id:
         return {"status": "error", "error": "order_id is required"}
 
+    clean_symbol = symbol.strip().upper() if isinstance(symbol, str) and symbol.strip() else None
+
+    # Credential isolation (opt-in): a cancel mutates broker state, so — like
+    # order placement — route it through TAP for human approval + server-side key
+    # injection when configured. No TAP env => unchanged direct-SDK path below.
+    if tap_forward.tap_enabled():
+        return _cancel_via_tap(cfg, clean_id, clean_symbol)
+
     try:
         client = _trading_client(cfg)
         client.cancel_order_by_id(clean_id)
@@ -481,11 +753,42 @@ def cancel_order(
     return {
         "status": "ok",
         "order_id": clean_id,
-        "symbol": symbol.strip().upper() if isinstance(symbol, str) and symbol.strip() else None,
+        "symbol": clean_symbol,
         "side": None,
         "profile": cfg.profile,
         "is_paper": cfg.is_paper,
         "cancelled": True,
+    }
+
+
+def _cancel_via_tap(cfg: AlpacaConfig, order_id: str, symbol: str | None) -> dict[str, Any]:
+    """Cancel an order through the TAP proxy instead of the Alpaca SDK.
+
+    A cancel mutates broker state (``DELETE /v2/orders/{id}``), so — like order
+    placement — it is human-approved and the broker secret is injected
+    server-side; the agent process holds no key. Alpaca returns 204 No Content on
+    success. Fails closed on deny/timeout, mirroring :func:`_submit_via_tap`.
+    """
+    target = f"{cfg.host}/v2/orders/{order_id}"
+    result = tap_forward.forward(target, "DELETE", None, _tap_cred_headers())
+    if not result.get("ok"):
+        decision = result.get("decision")
+        reason = result.get("error") or {
+            "denied": "cancel denied by approver",
+            "timeout": "approval timed out",
+            "timed_out": "approval timed out",
+        }.get(decision, "cancel not forwarded by TAP")
+        return {"status": "error", "error": f"TAP: {reason}", "tap_decision": decision}
+
+    return {
+        "status": "ok",
+        "order_id": order_id,
+        "symbol": symbol,
+        "side": None,
+        "profile": cfg.profile,
+        "is_paper": cfg.is_paper,
+        "cancelled": True,
+        "via": "tap",
     }
 
 
@@ -498,9 +801,9 @@ def _timeframe(period: str, time_frame_cls: Any, unit_cls: Any) -> Any:
     minute_amounts = {"1m": 1, "5m": 5, "15m": 15, "30m": 30}
     if token in minute_amounts:
         return time_frame_cls(minute_amounts[token], unit_cls.Minute)
-    if token in ("1h", "4h"):
-        return time_frame_cls(1 if token == "1h" else 4, unit_cls.Hour)
-    if token == "1w":
+    if token in ("1h", "1H", "4h", "4H"):
+        return time_frame_cls(1 if token in ("1h", "1H") else 4, unit_cls.Hour)
+    if token in ("1w", "1W"):
         return time_frame_cls(1, unit_cls.Week)
     if token == "1M":
         return time_frame_cls(1, unit_cls.Month)
@@ -543,6 +846,10 @@ def _data_feed(cfg: AlpacaConfig):
 
 
 def _missing_fields(cfg: AlpacaConfig) -> list[str]:
+    # On the TAP path the process holds no key — the secret lives in TAP and is
+    # injected server-side — so the local key pair is not required for readiness.
+    if tap_forward.tap_enabled():
+        return []
     missing = []
     if not cfg.api_key:
         missing.append("api_key")
@@ -584,10 +891,24 @@ def _obj_get(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def _position_to_dict(item: Any) -> dict[str, Any]:
+    # alpaca-py's Position.side is a (str, Enum) member whose str() is
+    # "PositionSide.SHORT", not "short" — read .value so the direct-SDK path
+    # emits the same lowercase token the TAP JSON path does.
+    side_raw = _obj_get(item, "side", "")
+    side = str(getattr(side_raw, "value", side_raw)).strip().lower()
+    quantity = _obj_get(item, "qty")
+    exact_quantity = Decimal(str(quantity)) if quantity is not None else None
+    if side == "short" and quantity is not None:
+        # Alpaca reports qty as an absolute magnitude and carries direction in
+        # side. The mandate gate (like the tiger connector) reads quantity as
+        # signed, so an unsigned short would book as positive exposure.
+        quantity = -float(quantity)
+        exact_quantity = -abs(exact_quantity)
     return {
         "symbol": _obj_get(item, "symbol"),
-        "side": str(_obj_get(item, "side", "")),
-        "quantity": _obj_get(item, "qty"),
+        "side": side,
+        "quantity": quantity,
+        "exact_quantity": format(exact_quantity, "f") if exact_quantity is not None else None,
         "average_cost": _obj_get(item, "avg_entry_price"),
         "market_value": _obj_get(item, "market_value"),
         "current_price": _obj_get(item, "current_price"),
@@ -599,17 +920,23 @@ def _position_to_dict(item: Any) -> dict[str, Any]:
 def _order_to_dict(item: Any) -> dict[str, Any]:
     return {
         "order_id": str(_obj_get(item, "id", "")),
+        "client_order_id": str(_obj_get(item, "client_order_id", "")),
         "symbol": _obj_get(item, "symbol"),
-        "side": str(_obj_get(item, "side", "")),
-        "order_type": str(_obj_get(item, "order_type", "") or _obj_get(item, "type", "")),
+        "side": _enum_token(_obj_get(item, "side", "")),
+        "order_type": _enum_token(_obj_get(item, "order_type", "") or _obj_get(item, "type", "")),
+        "time_in_force": _enum_token(_obj_get(item, "time_in_force", "")),
         "quantity": _obj_get(item, "qty"),
         "notional": _obj_get(item, "notional"),
         "filled_qty": _obj_get(item, "filled_qty"),
         "filled_avg_price": _obj_get(item, "filled_avg_price"),
         "limit_price": _obj_get(item, "limit_price"),
-        "status": str(_obj_get(item, "status", "")),
+        "status": _enum_token(_obj_get(item, "status", "")),
         "submitted_at": str(_obj_get(item, "submitted_at", "")),
     }
+
+
+def _enum_token(value: Any) -> str:
+    return str(getattr(value, "value", value)).strip().lower()
 
 
 def _bar_to_dict(item: Any) -> dict[str, Any]:

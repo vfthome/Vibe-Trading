@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #154
+# 简要说明: 国泰君安191短周期交易型alpha因子第154号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha 154 (国泰君安 191 短周期交易型 alpha 因子, 2014).
 
 Formula (verbatim from the report):
@@ -13,6 +19,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -60,4 +67,6 @@ def compute(panel):
     left = vw - ts_min(vw, 16)
     right = ts_corr(vw, ts_mean(v, 180), 18)
     out = (left < right).astype("float64") * -1.0
-    return out
+    # Reach of each input through the nested windows; a gap inside it is not a verdict (#1463).
+    # v: mean 180 + corr 18; vw: corr 18.
+    return out.where(observed_over((v, 197), (vw, 18)))

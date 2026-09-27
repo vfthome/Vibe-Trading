@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #61
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第61号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #61.
 
 Formula (paper appendix): rank(vwap - ts_min(vwap,16)) < rank(correlation(vwap, adv180, 18))
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['volume', 'vwap', 'close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 197,
@@ -55,4 +62,6 @@ def compute(panel: dict) -> pd.DataFrame:
     lhs = rank(vwap - ts_min(vwap, 16))
     rhs = rank(ts_corr(vwap, adv180, 18))
     out = (lhs < rhs).astype(float)
-    return out
+    # Reach of each input through the nested windows; a gap inside it is not a verdict (#1463).
+    # volume: adv180 + corr 18; vwap: corr 18.
+    return out.where(observed_over((volume, 197), (vwap, 18)))

@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #88
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第88号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #88.
 
 Formula (paper appendix): min(rank(decay_linear((rank(open)+rank(low))-(rank(high)+rank(close)),8)), Ts_Rank(decay_linear(correlation(Ts_Rank(close,8),Ts_Rank(adv60,20),8),7),3))
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['open', 'high', 'low', 'close', 'volume'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 94,
@@ -60,4 +67,7 @@ def compute(panel: dict) -> pd.DataFrame:
     arr_a = a.to_numpy(dtype=np.float64, na_value=np.nan)
     arr_b = b.to_numpy(dtype=np.float64, na_value=np.nan)
     out = pd.DataFrame(np.fmin(arr_a, arr_b), index=close.index, columns=close.columns)
+    # np.fmin returns the other side when one is missing; mask where a gap sits
+    # inside an input's reach (#1463). volume: adv60 + ts_rank 20 + corr 8 + decay 7 + ts_rank 3; close: ts_rank 8 + corr 8 + decay 7 + ts_rank 3; open/high/low: decay 8.
+    out = out.where(observed_over((volume, 94), (close, 23), (open_, 8), (high, 8), (low, 8)))
     return out

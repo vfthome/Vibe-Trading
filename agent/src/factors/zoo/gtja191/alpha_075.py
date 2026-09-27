@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #75
+# 简要说明: 国泰君安191短周期交易型alpha因子第75号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha #75.
 
 Formula: COUNT((CLOSE>OPEN & BENCHMARKINDEXCLOSE<DELAY(BENCHMARKINDEXCLOSE,1)),50)/COUNT(BENCHMARKINDEXCLOSE<DELAY(BENCHMARKINDEXCLOSE,1),50)
@@ -46,7 +52,8 @@ def compute(panel: dict) -> pd.DataFrame:
     bench_df = pd.DataFrame(np.broadcast_to(bench_row[:, None], c.shape).copy(),
                             index=c.index, columns=c.columns)
     bench_down = (bench_df < bench_df.shift(1)).astype(float)
-    up_and_down = ((c > o) & (bench_df < bench_df.shift(1))).astype(float)
+    # A bar with a missing open/close is not an up bar (#1463).
+    up_and_down = ((c > o) & (bench_df < bench_df.shift(1))).astype(float).where(c.notna() & o.notna())
     num = up_and_down.rolling(20, min_periods=20).sum()
     den = bench_down.rolling(20, min_periods=20).sum()
     return safe_div(num, den)

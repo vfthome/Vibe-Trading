@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #77
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第77号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #77.
 
 Formula (paper appendix): min(rank(decay_linear((high+low)/2 + high - (vwap+high), 20)), rank(decay_linear(correlation((high+low)/2, adv40, 3), 6)))
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['high', 'low', 'volume', 'vwap', 'close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 47,
@@ -60,4 +67,7 @@ def compute(panel: dict) -> pd.DataFrame:
     arr_a = a.to_numpy(dtype=np.float64, na_value=np.nan)
     arr_b = b.to_numpy(dtype=np.float64, na_value=np.nan)
     out = pd.DataFrame(np.fmin(arr_a, arr_b), index=close.index, columns=close.columns)
+    # np.fmin returns the other side when one is missing; mask where a gap sits
+    # inside an input's reach (#1463). volume: adv40 + corr 3 + decay 6; high/low/vwap: decay 20.
+    out = out.where(observed_over((volume, 47), (high, 20), (low, 20), (vwap, 20)))
     return out

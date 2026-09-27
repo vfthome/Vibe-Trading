@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #34
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第34号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #34.
 
 Formula (paper appendix): rank((1-rank(stddev(returns,2)/stddev(returns,5))) + (1-rank(delta(close,1))))
@@ -37,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 6,
@@ -50,7 +56,7 @@ def compute(panel: dict) -> pd.DataFrame:
     close = panel["close"]
 
 
-    returns = close.pct_change()
+    returns = close.pct_change(fill_method=None)
     # Helper aliases (local closures keep the file standalone & purity-safe).
     out = rank((1.0 - rank(safe_div(ts_std(returns, 2), ts_std(returns, 5)))) + (1.0 - rank(delta(close, 1))))
     return out

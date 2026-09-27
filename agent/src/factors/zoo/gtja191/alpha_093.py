@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #93
+# 简要说明: 国泰君安191短周期交易型alpha因子第93号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha #93.
 
 Formula: SUM((OPEN>=DELAY(OPEN,1)?0:MAX(OPEN-LOW,OPEN-DELAY(OPEN,1))),20)
@@ -45,5 +51,6 @@ def compute(panel: dict) -> pd.DataFrame:
     po = o.shift(1)
     move = pd.DataFrame(np.maximum((o - l).to_numpy(), (o - po).to_numpy()),
                         index=o.index, columns=o.columns)
-    keep = move.where(o < po, 0.0)
+    # A missing open, prior open or low is neither a down move nor a zero (#1463).
+    keep = move.where(o < po, 0.0).where(o.notna() & po.notna() & l.notna())
     return keep.rolling(20, min_periods=20).sum()

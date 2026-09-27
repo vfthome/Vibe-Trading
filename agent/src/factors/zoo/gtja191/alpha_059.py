@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #59 - 价格极值差
+# 简要说明: (-1*RANK(DELTA(MEAN(CLOSE,6),3))*RANK((CLOSE-MEAN(CLOSE,6))/MEAN(CLOSE,6)))，同Alpha#53/#55/#58。
+# 典型用途: 均线趋势与偏离度的综合判断。
+# ============================================================
 """GTJA Alpha #59.
 
 Formula: SUM((CLOSE=DELAY(CLOSE,1)?0:CLOSE-(CLOSE>DELAY(CLOSE,1)?MIN(LOW,DELAY(CLOSE,1)):MAX(HIGH,DELAY(CLOSE,1)))),20)
@@ -49,4 +55,10 @@ def compute(panel: dict) -> pd.DataFrame:
     ref = pd.DataFrame(np.where(up, np.minimum(l, pc), np.where(dn, np.maximum(h, pc), c)),
                        index=c.index, columns=c.columns)
     move = (c - ref).where(up | dn, 0.0)
+    # A NaN comparison is False, not NaN, so a missing close/prior-close
+    # (a halt, a gap) reads the same as a real "unchanged" tie and gets
+    # the 0.0 above instead of NaN. Mask those back to NaN so the rolling
+    # sum's own min_periods correctly turns NaN for every window still
+    # touching the gap, instead of silently summing a fabricated 0.0.
+    move = move.mask(c.isna() | pc.isna())
     return move.rolling(20, min_periods=20).sum()

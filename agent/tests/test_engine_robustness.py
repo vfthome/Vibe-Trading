@@ -9,9 +9,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import patch
 
@@ -39,7 +40,7 @@ class TestFfillLimit:
         df = pd.DataFrame({"close": close, "open": close}, index=dates)
         sig = pd.Series(1.0, index=dates)
 
-        _, close_df, _, _ = _align({"A": df}, {"A": sig}, ["A"])
+        _, close_df, _, _, _ = _align({"A": df}, {"A": sig}, ["A"])
         # 3-bar gap should be filled — no NaN in close
         assert close_df["A"].isna().sum() == 0
 
@@ -50,7 +51,7 @@ class TestFfillLimit:
         df = pd.DataFrame({"close": close, "open": close}, index=dates)
         sig = pd.Series(1.0, index=dates)
 
-        _, close_df, _, _ = _align({"A": df}, {"A": sig}, ["A"])
+        _, close_df, _, _, _ = _align({"A": df}, {"A": sig}, ["A"])
         # 8-bar gap: ffill covers first 5, remaining 3 should be NaN
         nan_count = close_df["A"].isna().sum()
         assert nan_count == 3, f"Expected 3 NaN bars after ffill limit=5, got {nan_count}"
@@ -72,7 +73,7 @@ class TestFfillLimit:
             "BAD": pd.Series(1.0, index=dates),
         }
 
-        _, close_df, pos_df, _ = _align(data_map, signal_map, ["GOOD", "BAD"])
+        _, close_df, _, pos_df, _ = _align(data_map, signal_map, ["GOOD", "BAD"])
         assert "BAD" not in close_df.columns, "All-NaN symbol should be dropped"
         assert "GOOD" in close_df.columns
         assert "BAD" not in pos_df.columns
@@ -115,19 +116,19 @@ class TestSymbolIsolation:
         signal_map = {"GOOD": sig.copy(), "BAD": sig.copy()}
         valid_codes = ["GOOD", "BAD"]
 
-        _, close_df, target_pos, _ = _align(data_map, signal_map, valid_codes)
+        _, close_df, _, target_pos, _ = _align(data_map, signal_map, valid_codes)
 
         engine = ChinaAEngine({"initial_cash": 1_000_000})
 
-        # Patch _rebalance to throw for BAD only
-        original_rebalance = ChinaAEngine._rebalance
+        # Patch the opening-plan boundary to throw for BAD only.
+        original_plan = ChinaAEngine._plan_open_order
 
-        def _exploding_rebalance(self, symbol, target_weight, df, ts, equity):
+        def _exploding_plan(self, symbol, target_weight, df, ts, equity, **kwargs):
             if symbol == "BAD":
                 raise RuntimeError("Simulated failure for BAD")
-            return original_rebalance(self, symbol, target_weight, df, ts, equity)
+            return original_plan(self, symbol, target_weight, df, ts, equity, **kwargs)
 
-        with patch.object(ChinaAEngine, "_rebalance", _exploding_rebalance):
+        with patch.object(ChinaAEngine, "_plan_open_order", _exploding_plan):
             # Should NOT raise — exception is caught internally
             engine._execute_bars(dates, data_map, close_df, target_pos, valid_codes)
 
@@ -164,9 +165,14 @@ class TestSymbolIsolation:
                 assert frame["income_total_revenue"].iloc[-1] == 120.0
                 return {"000001.SZ": pd.Series(0.0, index=frame.index)}
 
-        def fake_enrich(data_map, provider, fields_by_table, *, as_of, periods=None):
+        def fake_enrich(
+            data_map, provider, fields_by_table, *, as_of, periods=None, subdaily="reject"
+        ):
             assert fields_by_table == {"income": ["total_revenue"]}
             assert as_of == "2024-04-30"
+            # #1387: the engine forwards the sub-daily PIT policy, and the
+            # default must stay the fail-closed one.
+            assert subdaily == "reject"
             enriched = {code: frame.copy() for code, frame in data_map.items()}
             enriched["000001.SZ"]["income_total_revenue"] = [None, 80.0, 120.0]
             return enriched
@@ -216,24 +222,32 @@ class TestSymbolIsolation:
                 return {"000001.SZ": pd.Series(0.0, index=data_map["000001.SZ"].index)}
 
         def fake_resolve_benchmark(**kwargs):
-            return SimpleNamespace(
+            # The real result type, not a namespace: the engine re-measures the
+            # benchmark over the evaluated window via BenchmarkResult's own
+            # method, so a stub that only carries attributes would not exercise
+            # the path under test.
+            from backtest.benchmark import BenchmarkResult
+
+            return BenchmarkResult(
                 ticker="000300.SH",
                 ret_series=pd.Series([0.0, 0.01, -0.005], index=dates),
                 total_ret=0.00495,
+                close=pd.Series([100.0, 101.0, 100.495], index=dates),
             )
 
         monkeypatch.setattr("backtest.benchmark.resolve_benchmark", fake_resolve_benchmark)
 
         engine = ChinaAEngine({"initial_cash": 1_000_000})
+        config = {
+            "codes": ["000001.SZ"],
+            "start_date": "2024-04-01",
+            "end_date": "2024-04-30",
+            "source": "tushare",
+            "benchmark": "000300.SH",
+            "initial_cash": 1_000_000,
+        }
         metrics = engine.run_backtest(
-            {
-                "codes": ["000001.SZ"],
-                "start_date": "2024-04-01",
-                "end_date": "2024-04-30",
-                "source": "tushare",
-                "benchmark": "000300.SH",
-                "initial_cash": 1_000_000,
-            },
+            config,
             FakeLoader(),
             SignalEngine(),
             tmp_path,
@@ -245,7 +259,44 @@ class TestSymbolIsolation:
         run_card_path = tmp_path / "run_card.json"
         assert run_card_path.exists()
         run_card = json.loads(run_card_path.read_text(encoding="utf-8"))
-        assert run_card["schema_version"] == "0.1"
+        assert run_card["schema_version"] == "1.0"
+        assert len(run_card["tool_traces"]) == 1
+        assert run_card["tool_traces"][0]["tool"] == "backtest"
+        assert run_card["tool_traces"][0]["status"] == "ok"
+        started_at = datetime.fromisoformat(
+            run_card["tool_traces"][0]["started_at"].replace("Z", "+00:00")
+        )
+        ended_at = datetime.fromisoformat(
+            run_card["tool_traces"][0]["ended_at"].replace("Z", "+00:00")
+        )
+        assert started_at.tzinfo == timezone.utc
+        assert ended_at.tzinfo == timezone.utc
+        assert started_at <= ended_at
+        assert (
+            run_card["tool_traces"][0]["args_hash"]
+            == hashlib.sha256(
+                json.dumps(
+                    config,
+                    sort_keys=True,
+                    default=str,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        assert (
+            run_card["tool_traces"][0]["result_hash"]
+            == hashlib.sha256(
+                json.dumps(
+                    metrics,
+                    sort_keys=True,
+                    default=str,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        assert run_card["citations"]
         assert run_card["backtest"]["codes"] == ["000001.SZ"]
         assert run_card["data_sources"] == ["tushare"]
         assert run_card["metrics"]["benchmark_return"] == 0.00495
@@ -290,6 +341,24 @@ class TestBacktestConfigSchema:
         assert c.codes == ["AAPL.US"]
         assert c.interval == "1D"
         assert c.engine == "daily"
+        assert c.position_adjustment == "hold"
+
+    def test_position_adjustment_accepts_rebalance_and_rejects_unknown_mode(self) -> None:
+        valid = BacktestConfigSchema(
+            codes=["AAPL.US"],
+            start_date="2025-01-01",
+            end_date="2025-06-01",
+            position_adjustment="rebalance",
+        )
+        assert valid.position_adjustment == "rebalance"
+
+        with pytest.raises(ValueError, match="position_adjustment"):
+            BacktestConfigSchema(
+                codes=["AAPL.US"],
+                start_date="2025-01-01",
+                end_date="2025-06-01",
+                position_adjustment="resize",
+            )
 
     def test_fundamental_fields_must_be_table_to_field_list_mapping(self) -> None:
         with pytest.raises(ValueError, match="fundamental_fields"):
@@ -354,6 +423,61 @@ class TestBacktestConfigSchema:
                 end_date="2025-06-01",
                 source="bloomberg",
             )
+
+    @pytest.mark.parametrize(
+        "initial_cash", [0, -1, -1_000_000, float("inf"), float("-inf"), float("nan"), "Infinity"]
+    )
+    def test_non_finite_or_non_positive_initial_cash_rejected(
+        self, initial_cash: object
+    ) -> None:
+        """A non-positive initial_cash makes returns divide by <= 0 and yields
+        inf/NaN metrics; reject it at the config boundary."""
+        with pytest.raises(Exception, match="initial_cash"):
+            BacktestConfigSchema(
+                codes=["AAPL.US"],
+                start_date="2025-01-01",
+                end_date="2025-06-01",
+                initial_cash=initial_cash,
+            )
+
+    def test_initial_cash_defaults_and_accepts_positive(self) -> None:
+        default = BacktestConfigSchema(
+            codes=["AAPL.US"], start_date="2025-01-01", end_date="2025-06-01"
+        )
+        assert default.initial_cash == 1_000_000
+        explicit = BacktestConfigSchema(
+            codes=["AAPL.US"],
+            start_date="2025-01-01",
+            end_date="2025-06-01",
+            initial_cash=50_000,
+        )
+        assert explicit.initial_cash == 50_000
+
+    def test_mootdx_and_futu_sources_accepted(self) -> None:
+        """mootdx and futu are registered loaders, so config validation must
+        accept them. Regression: ``_VALID_SOURCES`` drifted and rejected both
+        even though the agent-facing backtest tool already allowed them."""
+        for src in ("mootdx", "futu"):
+            c = BacktestConfigSchema(
+                codes=["000001.SZ"],
+                start_date="2025-01-01",
+                end_date="2025-06-01",
+                source=src,
+            )
+            assert c.source == src
+
+    def test_valid_sources_covers_all_registered_loaders(self) -> None:
+        """Every registered loader name must be an accepted config source, so a
+        new loader can never be silently rejected by the config schema."""
+        from backtest.loaders.registry import (
+            LOADER_REGISTRY,
+            VALID_SOURCES,
+            _ensure_registered,
+        )
+
+        _ensure_registered()
+        missing = set(LOADER_REGISTRY) - VALID_SOURCES
+        assert not missing, f"loaders missing from VALID_SOURCES: {missing}"
 
     def test_extra_fields_allowed(self) -> None:
         """Config may contain engine-specific fields not in the schema."""
@@ -479,7 +603,7 @@ class TestFullBacktestRobustness:
         signal_map = {"NORMAL": sig.copy(), "SUSPENDED": sig.copy()}
         valid_codes = ["NORMAL", "SUSPENDED"]
 
-        _, close_df, target_pos, _ = _align(data_map, signal_map, valid_codes)
+        _, close_df, _, target_pos, _ = _align(data_map, signal_map, valid_codes)
 
         # The 14-bar gap should not be fully filled
         suspended_nan_count = close_df["SUSPENDED"].isna().sum()
@@ -491,3 +615,78 @@ class TestFullBacktestRobustness:
         engine = ChinaAEngine({"initial_cash": 1_000_000})
         engine._execute_bars(dates, data_map, close_df, target_pos, valid_codes)
         assert len(engine.equity_snapshots) == 20
+
+
+# ---------------------------------------------------------------------------
+# 6. Validation artifact — write must not assume artifacts/ already exists
+# ---------------------------------------------------------------------------
+
+
+class TestValidationArtifactDir:
+    def test_validation_json_written_when_artifacts_dir_absent(
+        self, tmp_path: Path
+    ) -> None:
+        """Enabling validation must not crash when run_dir/artifacts is absent.
+
+        The validation.json write (step 7) runs before _write_artifacts()
+        (step 8) creates run_dir/artifacts, so the write must create the
+        directory itself. Regression test for the FileNotFoundError hit when
+        run_dir has no pre-created artifacts/ (e.g. a swarm agent workspace).
+        """
+        dates = pd.bdate_range("2024-04-01", periods=3)
+        bars = pd.DataFrame(
+            {
+                "open": [10.0, 11.0, 12.0],
+                "high": [10.5, 11.5, 12.5],
+                "low": [9.5, 10.5, 11.5],
+                "close": [10.2, 11.2, 12.2],
+                "volume": [1000, 1100, 1200],
+            },
+            index=dates,
+        )
+
+        class FakeLoader:
+            def fetch(self, *args, **kwargs):
+                return {"000001.SZ": bars.copy()}
+
+        class SignalEngine:
+            def generate(self, data_map):
+                return {"000001.SZ": pd.Series(1.0, index=data_map["000001.SZ"].index)}
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        assert not (run_dir / "artifacts").exists()
+
+        engine = ChinaAEngine({"initial_cash": 1_000_000})
+        non_finite = {
+            "bootstrap": {
+                "observed_sharpe": float("inf"),
+                "median_sharpe": float("nan"),
+            }
+        }
+        with patch("backtest.validation.run_validation", return_value=non_finite):
+            metrics = engine.run_backtest(
+                {
+                    "codes": ["000001.SZ"],
+                    "start_date": "2024-04-01",
+                    "end_date": "2024-04-30",
+                    "source": "tushare",
+                    "initial_cash": 1_000_000,
+                    "validation": {"bootstrap": {"n_bootstrap": 20, "seed": 1}},
+                },
+                FakeLoader(),
+                SignalEngine(),
+                run_dir,
+            )
+
+        assert "validation" in metrics
+        validation_path = run_dir / "artifacts" / "validation.json"
+        parsed = json.loads(
+            validation_path.read_text(encoding="utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-strict JSON constant: {value}")
+            ),
+        )
+        assert parsed == {
+            "bootstrap": {"observed_sharpe": None, "median_sharpe": None}
+        }

@@ -10,6 +10,8 @@ the happy path is unchanged (one call per page).
 
 from __future__ import annotations
 
+import importlib
+
 import pandas as pd
 import pytest
 
@@ -23,7 +25,7 @@ SINCE = int(pd.Timestamp("2026-05-01").timestamp() * 1000)
 END = int((pd.Timestamp("2026-05-05") + pd.Timedelta(days=1)).timestamp() * 1000)
 
 
-def _bars(n: int = 4) -> list:
+def _bars(n: int = 5) -> list:
     base = int(pd.Timestamp("2026-05-01").timestamp() * 1000)
     day = 86_400_000
     return [[base + i * day, 100 + i, 101 + i, 99 + i, 100 + i, 10 + i] for i in range(n)]
@@ -87,6 +89,56 @@ def test_wallclock_budget_enforced(monkeypatch):
         DataLoader._fetch_one(ex, "BTC/USDT", "1d", SINCE, END)
 
 
+def test_page_cap_rejects_incomplete_requested_history():
+    minute_ms = 60_000
+
+    class FullPageExchange:
+        def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
+            del symbol, timeframe
+            assert since is not None
+            assert limit == 1000
+            return [
+                [since + i * minute_ms, 100.0, 101.0, 99.0, 100.0, 10.0]
+                for i in range(limit)
+            ]
+
+    end = int((pd.Timestamp("2027-05-01") + pd.Timedelta(days=1)).timestamp() * 1000)
+
+    with pytest.raises(ValueError, match="incomplete"):
+        DataLoader._fetch_one(FullPageExchange(), "BTC/USDT", "1m", SINCE, end)
+
+
 def test_get_exchange_sets_explicit_timeout():
     ex = DataLoader()._get_exchange()
     assert ex.timeout == cl._CCXT_TIMEOUT_MS
+
+
+def test_invalid_timeout_env_values_fall_back_on_reload(monkeypatch, caplog):
+    monkeypatch.setenv("CCXT_TIMEOUT_MS", "abc")
+    monkeypatch.setenv("CCXT_FETCH_BUDGET_S", "nope")
+    try:
+        with caplog.at_level("WARNING", logger="backtest.loaders.base"):
+            module = importlib.reload(cl)
+
+        assert module._CCXT_TIMEOUT_MS == 15_000
+        assert module._CCXT_FETCH_BUDGET_S == 60.0
+        assert "CCXT_TIMEOUT_MS" in caplog.text
+        assert "CCXT_FETCH_BUDGET_S" in caplog.text
+    finally:
+        monkeypatch.delenv("CCXT_TIMEOUT_MS", raising=False)
+        monkeypatch.delenv("CCXT_FETCH_BUDGET_S", raising=False)
+        importlib.reload(cl)
+
+
+def test_valid_timeout_env_values_are_honored_on_reload(monkeypatch):
+    monkeypatch.setenv("CCXT_TIMEOUT_MS", "1234")
+    monkeypatch.setenv("CCXT_FETCH_BUDGET_S", "2.5")
+    try:
+        module = importlib.reload(cl)
+
+        assert module._CCXT_TIMEOUT_MS == 1234
+        assert module._CCXT_FETCH_BUDGET_S == 2.5
+    finally:
+        monkeypatch.delenv("CCXT_TIMEOUT_MS", raising=False)
+        monkeypatch.delenv("CCXT_FETCH_BUDGET_S", raising=False)
+        importlib.reload(cl)

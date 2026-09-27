@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #56 - 开盘位序
+# 简要说明: (RANK(OPEN-TSMIN(OPEN,12)) < RANK((RANK(CORR(SUM(((HIGH+LOW)/2),19),SUM(MEAN(VOLUME,40),19),13))^5)))，开盘位置排名与量价相关排名的比较。
+# 典型用途: 比较开盘相对位置与量价关系强度，生成二元信号。
+# ============================================================
 """GTJA Alpha #56.
 
 Formula: (RANK(OPEN-TSMIN(OPEN,12)) < RANK((RANK(CORR(SUM(((HIGH+LOW)/2),19),SUM(MEAN(VOLUME,40),19),13))^5)))
@@ -11,6 +17,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     signed_power,
@@ -49,4 +56,7 @@ def compute(panel: dict) -> pd.DataFrame:
     sumA = mid.rolling(19, min_periods=19).sum()
     sumB = ts_mean(v, 30).rolling(19, min_periods=19).sum()
     rhs = rank(rank(ts_corr(sumA, sumB, 13)) ** 5)
-    return (lhs < rhs).astype(float)
+    # Reach of each input through the nested windows; a gap inside it is not a verdict (#1463).
+    # v: mean 30 + sum 19 + corr 13; h/l: sum 19 + corr 13; o: ts_min 12.
+    present = observed_over((v, 60), (h, 31), (l, 31), (o, 12))
+    return (lhs < rhs).astype(float).where(present)

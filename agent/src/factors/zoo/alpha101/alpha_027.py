@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #27
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第27号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #27.
 
 Formula (paper appendix): (0.5<rank((sum(correlation(rank(volume),rank(vwap),6),2)/2.0)))?(-1):1
@@ -37,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['volume', 'vwap', 'close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 10,
@@ -89,4 +95,8 @@ def compute(panel: dict) -> pd.DataFrame:
     where_ternary = _where_ternary
     x = rank(rolling_sum(ts_corr(rank(volume), rank(vwap), 6), 2) / 2.0)
     out = where_ternary(x > 0.5, -1.0 * make_one(close), make_one(close))
-    return out
+    # A NaN comparison is False, not NaN, so where_ternary's own
+    # np.isfinite safety net never fires here: both branches are pure
+    # constants with no NaN dependency at all, so the chain stays finite
+    # through warmup instead of NaN.
+    return out.where(x.notna())

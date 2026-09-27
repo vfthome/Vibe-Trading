@@ -32,11 +32,19 @@ def test_extract_us_hk_a_share_and_crypto_symbols() -> None:
         "crypto": "Hedge with BTC-USDT",
         "shenzhen": "000001.SZ for liquidity",
         "beijing": "Listed on 430090.BJ recently",
+        "canada": "Compare TD.TO with TSX Venture name PNG.V",
     }
     found = grounding.extract_symbols_from_user_vars(user_vars)
     assert set(found) == {
         "NVDA.US", "700.HK", "600519.SH", "BTC-USDT", "000001.SZ", "430090.BJ",
+        "TD.TO", "PNG.V",
     }
+
+
+def test_extract_canadian_class_symbol() -> None:
+    assert grounding.extract_symbols_from_user_vars(
+        {"target": "Review BBD-B.TO in CAD"}
+    ) == ["BBD-B.TO"]
 
 
 def test_extract_preserves_first_occurrence_order() -> None:
@@ -58,11 +66,50 @@ def test_extract_returns_empty_when_no_symbol_present() -> None:
 
 def test_extract_skips_non_string_values() -> None:
     user_vars = {
-        "ticker": "TSM",                # bare ticker — intentionally not matched
         "weight": 0.5,                  # type: ignore[dict-item]  — not a str
         "real_target": "TSLA.US",
     }
     assert grounding.extract_symbols_from_user_vars(user_vars) == ["TSLA.US"]
+
+
+def test_extract_promotes_bare_us_ticker() -> None:
+    # The #198 reporter's exact shape: investment_committee target text with
+    # a bare US ticker and no loader suffix anywhere.
+    user_vars = {
+        "target": "Evaluate whether to go long or short on NVDA given current market conditions",
+        "market": "A-shares",
+    }
+    assert grounding.extract_symbols_from_user_vars(user_vars) == ["NVDA.US"]
+
+
+def test_extract_bare_ticker_skips_common_acronyms() -> None:
+    user_vars = {
+        "goal": "US CPI and FED policy impact on AI ETF flows; CEO guidance, PE ratios, USD strength",
+    }
+    assert grounding.extract_symbols_from_user_vars(user_vars) == []
+
+
+def test_extract_bare_ticker_does_not_duplicate_suffixed_symbol() -> None:
+    user_vars = {"goal": "Compare NVDA.US against a bare NVDA mention"}
+    assert grounding.extract_symbols_from_user_vars(user_vars) == ["NVDA.US"]
+
+
+def test_extract_bare_scan_does_not_split_suffixed_symbols() -> None:
+    # BTC-USDT must stay one crypto pair; neither BTC.US nor USDT.US may leak.
+    user_vars = {"goal": "Hedge BTC-USDT exposure into quarter end"}
+    assert grounding.extract_symbols_from_user_vars(user_vars) == ["BTC-USDT"]
+
+
+def test_extract_explicit_symbols_rank_before_bare_promotions() -> None:
+    # Explicit suffixed symbols must win the max-symbols cap, so they sort
+    # first even when a bare ticker appears earlier in the text.
+    user_vars = {"goal": "MSTR leverage versus 600519.SH stability"}
+    assert grounding.extract_symbols_from_user_vars(user_vars) == ["600519.SH", "MSTR.US"]
+
+
+def test_extract_ignores_lowercase_and_single_letter_tokens() -> None:
+    user_vars = {"goal": "buy nvda now, grade A balance sheet"}
+    assert grounding.extract_symbols_from_user_vars(user_vars) == []
 
 
 def test_extract_does_not_match_substrings_inside_words() -> None:

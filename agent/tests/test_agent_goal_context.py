@@ -29,8 +29,12 @@ class _CapturingLLM:
         messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> _AnswerResponse:
-        del tools, on_text_chunk
+        del tools, on_text_chunk, on_reasoning_chunk
         self.messages = messages
         self.calls.append([dict(item) for item in messages])
         return _AnswerResponse(total_tokens=self.total_tokens)

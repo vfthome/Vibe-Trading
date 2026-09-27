@@ -1,236 +1,372 @@
-﻿import { Bot, TrendingUp, Globe, Sparkles, Users, UserCircle2, NotebookPen, Landmark } from "lucide-react";
+import { useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { ChevronDown, TrendingUp, Globe, Sparkles, Users, UserCircle2, NotebookPen, Landmark, Gem } from "lucide-react";
+import { BrandMark } from "@/components/common/BrandMark";
 
 interface Example {
-  title: string;
-  desc: string;
-  prompt: string;
+  titleKey: string;
+  descKey: string;
+  promptKey: string;
 }
 
 interface Category {
-  label: string;
+  labelKey: string;
   icon: React.ReactNode;
-  color: string;
   examples: Example[];
 }
 
 const CATEGORIES: Category[] = [
   {
-    label: "Multi-Market Backtest",
+    labelKey: "welcome.categories.multiMarketBacktest",
     icon: <TrendingUp className="h-4 w-4" />,
-    color: "text-red-400 border-red-500/30 hover:border-red-500/60 hover:bg-red-500/5",
     examples: [
       {
-        title: "Cross-Market Portfolio",
-        desc: "A-shares + crypto + US equities with risk-parity optimizer",
-        prompt: "Backtest a risk-parity portfolio of 000001.SZ, BTC-USDT, and AAPL for full-year 2024, compare against equal-weight baseline",
+        titleKey: "welcome.examples.crossMarketPortfolio",
+        descKey: "welcome.examples.crossMarketPortfolioDesc",
+        promptKey: "welcome.examples.crossMarketPortfolioPrompt",
       },
       {
-        title: "BTC 5-Min MACD Strategy",
-        desc: "Minute-level crypto backtest with real-time OKX data",
-        prompt: "Backtest BTC-USDT 5-minute MACD strategy, fast=12 slow=26 signal=9, last 30 days",
+        titleKey: "welcome.examples.btcMacd",
+        descKey: "welcome.examples.btcMacdDesc",
+        promptKey: "welcome.examples.btcMacdPrompt",
       },
       {
-        title: "US Tech Max Diversification",
-        desc: "Portfolio optimizer across FAANG+ via yfinance",
-        prompt: "Backtest AAPL, MSFT, GOOGL, AMZN, NVDA with max_diversification portfolio optimizer, full-year 2024",
+        titleKey: "welcome.examples.usTechMaxDiv",
+        descKey: "welcome.examples.usTechMaxDivDesc",
+        promptKey: "welcome.examples.usTechMaxDivPrompt",
       },
     ],
   },
   {
-    label: "Research & Analysis",
+    labelKey: "welcome.categories.researchAnalysis",
     icon: <Sparkles className="h-4 w-4" />,
-    color: "text-amber-400 border-amber-500/30 hover:border-amber-500/60 hover:bg-amber-500/5",
     examples: [
       {
-        title: "Multi-Factor Alpha Model",
-        desc: "IC-weighted factor synthesis across 300 stocks",
-        prompt: "Build a multi-factor alpha model using momentum, reversal, volatility, and turnover on CSI 300 constituents with IC-weighted factor synthesis, backtest 2023-2024",
+        titleKey: "welcome.examples.multiFactorAlpha",
+        descKey: "welcome.examples.multiFactorAlphaDesc",
+        promptKey: "welcome.examples.multiFactorAlphaPrompt",
       },
       {
-        title: "Options Greeks Analysis",
-        desc: "Black-Scholes pricing with Delta/Gamma/Theta/Vega",
-        prompt: "Calculate option Greeks using Black-Scholes: spot=100, strike=105, risk-free rate=3%, vol=25%, expiry=90 days, analyze Delta/Gamma/Theta/Vega",
+        titleKey: "welcome.examples.optionsGreeks",
+        descKey: "welcome.examples.optionsGreeksDesc",
+        promptKey: "welcome.examples.optionsGreeksPrompt",
       },
     ],
   },
   {
-    label: "Swarm Teams",
+    labelKey: "welcome.categories.valueInvesting",
+    icon: <Gem className="h-4 w-4" />,
+    examples: [
+      {
+        titleKey: "welcome.examples.valueCommittee",
+        descKey: "welcome.examples.valueCommitteeDesc",
+        promptKey: "welcome.examples.valueCommitteePrompt",
+      },
+      {
+        titleKey: "welcome.examples.bottleneckHunter",
+        descKey: "welcome.examples.bottleneckHunterDesc",
+        promptKey: "welcome.examples.bottleneckHunterPrompt",
+      },
+      {
+        titleKey: "welcome.examples.thesisTracker",
+        descKey: "welcome.examples.thesisTrackerDesc",
+        promptKey: "welcome.examples.thesisTrackerPrompt",
+      },
+      {
+        titleKey: "welcome.examples.valuationCheck",
+        descKey: "welcome.examples.valuationCheckDesc",
+        promptKey: "welcome.examples.valuationCheckPrompt",
+      },
+    ],
+  },
+  {
+    labelKey: "welcome.categories.swarmTeams",
     icon: <Users className="h-4 w-4" />,
-    color: "text-violet-400 border-violet-500/30 hover:border-violet-500/60 hover:bg-violet-500/5",
     examples: [
       {
-        title: "Investment Committee Review",
-        desc: "Multi-agent debate: long vs short, risk review, PM decision",
-        prompt: "[Swarm Team Mode] Use the investment_committee preset to evaluate whether to go long or short on NVDA given current market conditions",
+        titleKey: "welcome.examples.investmentCommittee",
+        descKey: "welcome.examples.investmentCommitteeDesc",
+        promptKey: "welcome.examples.investmentCommitteePrompt",
       },
       {
-        title: "Quant Strategy Desk",
-        desc: "Screening → factor research → backtest → risk audit pipeline",
-        prompt: "[Swarm Team Mode] Use the quant_strategy_desk preset to find and backtest the best momentum strategy on CSI 300 constituents",
+        titleKey: "welcome.examples.quantStrategyDesk",
+        descKey: "welcome.examples.quantStrategyDeskDesc",
+        promptKey: "welcome.examples.quantStrategyDeskPrompt",
       },
     ],
   },
   {
-    label: "Document & Web Research",
+    labelKey: "welcome.categories.docWebResearch",
     icon: <Globe className="h-4 w-4" />,
-    color: "text-blue-400 border-blue-500/30 hover:border-blue-500/60 hover:bg-blue-500/5",
     examples: [
       {
-        title: "Analyze an Earnings Report PDF",
-        desc: "Upload a PDF and ask questions about the financials",
-        prompt: "Summarize the key financial metrics, risks, and outlook from the uploaded earnings report",
+        titleKey: "welcome.examples.earningsReport",
+        descKey: "welcome.examples.earningsReportDesc",
+        promptKey: "welcome.examples.earningsReportPrompt",
       },
       {
-        title: "Web Research: Macro Outlook",
-        desc: "Read live web sources for macro analysis",
-        prompt: "Read the latest Fed meeting minutes and summarize the key takeaways for equity and crypto markets",
+        titleKey: "welcome.examples.macroResearch",
+        descKey: "welcome.examples.macroResearchDesc",
+        promptKey: "welcome.examples.macroResearchPrompt",
       },
     ],
   },
   {
-    label: "Trade Journal",
+    labelKey: "welcome.categories.tradeJournal",
     icon: <NotebookPen className="h-4 w-4" />,
-    color: "text-orange-400 border-orange-500/30 hover:border-orange-500/60 hover:bg-orange-500/5",
     examples: [
       {
-        title: "Analyze My Broker Export",
-        desc: "Parse 同花顺/东财/富途/generic CSV — holding days, win rate, PnL ratio, hourly distribution",
-        prompt: "Analyze the trade journal I just uploaded — full profile with holding stats, win rate, top symbols, and hourly distribution",
+        titleKey: "welcome.examples.analyzeBrokerExport",
+        descKey: "welcome.examples.analyzeBrokerExportDesc",
+        promptKey: "welcome.examples.analyzeBrokerExportPrompt",
       },
       {
-        title: "Diagnose My Behavior Biases",
-        desc: "Disposition effect, overtrading, chasing momentum, anchoring — severity + numeric evidence",
-        prompt: "Run the 4 behavior diagnostics on my trade journal (disposition, overtrading, chasing, anchoring) and tell me which bias hurts my PnL most",
+        titleKey: "welcome.examples.diagnoseBehavior",
+        descKey: "welcome.examples.diagnoseBehaviorDesc",
+        promptKey: "welcome.examples.diagnoseBehaviorPrompt",
       },
     ],
   },
   {
-    label: "Trading Connectors",
+    labelKey: "welcome.categories.tradingConnectors",
     icon: <Landmark className="h-4 w-4" />,
-    color: "text-cyan-400 border-cyan-500/30 hover:border-cyan-500/60 hover:bg-cyan-500/5",
     examples: [
       {
-        title: "Check Selected Connector",
-        desc: "List connector profiles and verify the selected one",
-        prompt: "List my trading connector profiles, show which one is selected, then check that selected connector. If it is not ready, tell me exactly what setup step is missing. Do not place or modify orders.",
+        titleKey: "welcome.examples.checkConnector",
+        descKey: "welcome.examples.checkConnectorDesc",
+        promptKey: "welcome.examples.checkConnectorPrompt",
       },
       {
-        title: "Analyze Connector Portfolio",
-        desc: "Read account summary and positions from the selected connector",
-        prompt: "Use the selected trading connector profile to summarize my account, positions, concentration, cash, and portfolio risk. Do not place or modify orders.",
+        titleKey: "welcome.examples.analyzePortfolio",
+        descKey: "welcome.examples.analyzePortfolioDesc",
+        promptKey: "welcome.examples.analyzePortfolioPrompt",
       },
       {
-        title: "Quote & Trend",
-        desc: "Fetch a quote plus recent daily bars through the selected connector",
-        prompt: "Use the selected trading connector to fetch an AAPL quote and 30 daily bars, then summarize the current quote versus the recent trend. Keep it read-only.",
+        titleKey: "welcome.examples.quoteTrend",
+        descKey: "welcome.examples.quoteTrendDesc",
+        promptKey: "welcome.examples.quoteTrendPrompt",
       },
     ],
   },
   {
-    label: "Shadow Account",
+    labelKey: "welcome.categories.shadowAccount",
     icon: <UserCircle2 className="h-4 w-4" />,
-    color: "text-emerald-400 border-emerald-500/30 hover:border-emerald-500/60 hover:bg-emerald-500/5",
     examples: [
       {
-        title: "Train My Shadow from Journal",
-        desc: "Extract your strategy rules from a broker CSV and persist a Shadow profile",
-        prompt: "Train my shadow account from the trading journal I just uploaded — show the extracted rules and confirm they look like my behavior",
+        titleKey: "welcome.examples.trainShadow",
+        descKey: "welcome.examples.trainShadowDesc",
+        promptKey: "welcome.examples.trainShadowPrompt",
       },
       {
-        title: "How Much Am I Leaving on the Table?",
-        desc: "Backtest your shadow strategy and attribute delta vs. your actual PnL",
-        prompt: "Run a shadow backtest for the last 90 days on the US market and break down where my PnL diverged from the shadow (rule violations, early exits, missed signals)",
+        titleKey: "welcome.examples.shadowDelta",
+        descKey: "welcome.examples.shadowDeltaDesc",
+        promptKey: "welcome.examples.shadowDeltaPrompt",
       },
       {
-        title: "Generate Shadow Report",
-        desc: "8-section HTML/PDF — equity curve, per-market Sharpe, attribution waterfall",
-        prompt: "Render the shadow report and give me the URL — lead with the you-vs-shadow delta",
+        titleKey: "welcome.examples.shadowReport",
+        descKey: "welcome.examples.shadowReportDesc",
+        promptKey: "welcome.examples.shadowReportPrompt",
       },
     ],
   },
 ];
 
-const CAPABILITY_CHIPS = [
-  "Finance Skills Library",
-  "Swarm Agent Teams",
-  "Auto-Discovered Tools",
-  "3 Markets: A-Share · Crypto · HK/US",
-  "Trading Connector Profiles",
-  "Minute to Daily Timeframes",
-  "4 Portfolio Optimizers",
-  "15+ Risk Metrics",
-  "Options & Derivatives",
-  "PDF & Web Research",
-  "Factor Analysis & ML",
-  "Trade Journal Analyzer",
-  "Shadow Account Backtest",
-  "Persistent Memory",
-  "Session Search",
-];
+const GREETING_KEYS = {
+  morning: [
+    "welcome.greetings.morning1",
+    "welcome.greetings.morning2",
+    "welcome.greetings.morning3",
+  ],
+  afternoon: [
+    "welcome.greetings.afternoon1",
+    "welcome.greetings.afternoon2",
+    "welcome.greetings.afternoon3",
+  ],
+  evening: [
+    "welcome.greetings.evening1",
+    "welcome.greetings.evening2",
+    "welcome.greetings.evening3",
+  ],
+  night: [
+    "welcome.greetings.night1",
+    "welcome.greetings.night2",
+    "welcome.greetings.night3",
+  ],
+} as const;
+
+const QUICK_ACTIONS = [
+  {
+    titleKey: "welcome.examples.valuationCheck",
+    promptKey: "welcome.examples.valuationCheckPrompt",
+    icon: <Gem className="h-4 w-4" aria-hidden="true" />,
+  },
+  {
+    titleKey: "welcome.examples.optionsGreeks",
+    promptKey: "welcome.examples.optionsGreeksPrompt",
+    icon: <Sparkles className="h-4 w-4" aria-hidden="true" />,
+  },
+  {
+    titleKey: "welcome.examples.crossMarketPortfolio",
+    promptKey: "welcome.examples.crossMarketPortfolioPrompt",
+    icon: <TrendingUp className="h-4 w-4" aria-hidden="true" />,
+  },
+  {
+    titleKey: "welcome.examples.investmentCommittee",
+    promptKey: "welcome.examples.investmentCommitteePrompt",
+    icon: <Users className="h-4 w-4" aria-hidden="true" />,
+  },
+] as const;
+
+function pickGreetingKey(): string {
+  const hour = new Date().getHours();
+  const bucket =
+    hour >= 5 && hour < 12
+      ? "morning"
+      : hour >= 12 && hour < 17
+        ? "afternoon"
+        : hour >= 17 && hour < 22
+          ? "evening"
+          : "night";
+  const variants = GREETING_KEYS[bucket];
+  return variants[Math.floor(Math.random() * variants.length)] ?? variants[0];
+}
 
 interface Props {
   onExample: (s: string) => void;
 }
 
 export function WelcomeScreen({ onExample }: Props) {
+  const { t } = useTranslation();
+  const [greetingKey] = useState(() => pickGreetingKey());
+  const [isExamplesOpen, setIsExamplesOpen] = useState(false);
+  const [activeCategory, setActiveCategory] = useState(0);
+  const [activeAction, setActiveAction] = useState<string | null>(null);
+  const examplesTriggerRef = useRef<HTMLButtonElement>(null);
+
   return (
-    <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-8 text-center">
-      {/* Header */}
-      <div className="space-y-3">
-        <div className="h-16 w-16 mx-auto rounded-2xl bg-gradient-to-br from-primary/80 to-info/80 flex items-center justify-center shadow-lg">
-          <Bot className="h-8 w-8 text-white" />
-        </div>
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">Vibe-Trading</h2>
-          <p className="text-xs text-muted-foreground mt-1 max-w-sm mx-auto leading-relaxed">
-            vibe trading with your professional financial agent team
-          </p>
-          <p className="text-sm text-muted-foreground mt-2 max-w-md leading-relaxed mx-auto">
-            Describe a trading strategy to get started.
+    <div className="flex w-full flex-col items-center px-4 pb-14 text-center">
+      <div className="w-full max-w-3xl">
+        <div className="mx-auto max-w-2xl">
+          <div className="flex items-center justify-center gap-3">
+            <BrandMark className="h-9 w-9 shrink-0" />
+            <h1 className="font-serif text-[34px] font-normal leading-tight sm:text-[40px]">
+              {t(greetingKey as any)}
+            </h1>
+          </div>
+          <p className="mt-3 text-sm text-muted-foreground">
+            {t("welcome.taskSubtitle" as any)}
           </p>
         </div>
-      </div>
 
-      {/* Capability chips */}
-      <div className="flex flex-wrap justify-center gap-2 max-w-lg">
-        {CAPABILITY_CHIPS.map((chip) => (
-          <span
-            key={chip}
-            className="px-2.5 py-1 text-xs rounded-full border border-border/60 text-muted-foreground bg-muted/30"
-          >
-            {chip}
-          </span>
-        ))}
-      </div>
+        <div
+          className="mt-8 flex flex-wrap justify-center gap-2"
+          role="group"
+          aria-label={t("welcome.quickActions" as any)}
+        >
+          {QUICK_ACTIONS.map((action) => {
+            const isActive = action.titleKey === activeAction;
+            return (
+              <button
+                key={action.titleKey}
+                type="button"
+                aria-pressed={isActive}
+                onClick={() => {
+                  setActiveAction(action.titleKey);
+                  onExample(t(action.promptKey as any));
+                }}
+                className={
+                  isActive
+                    ? "inline-flex items-center gap-2 rounded-full border border-primary/30 bg-primary/[0.08] px-4 py-2 text-sm text-primary transition-colors hover:border-primary/50 hover:bg-primary/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                    : "inline-flex items-center gap-2 rounded-full border border-border/60 bg-card px-4 py-2 text-sm transition-colors hover:border-primary/40 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                }
+              >
+                {action.icon}
+                <span>{t(action.titleKey as any)}</span>
+              </button>
+            );
+          })}
+        </div>
 
-      {/* Example categories grid */}
-      <div className="w-full max-w-2xl text-left space-y-4">
-        <p className="text-xs text-muted-foreground px-1">Try an example:</p>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          {CATEGORIES.map((cat) => (
-            <div key={cat.label} className="space-y-2">
-              <div className={`flex items-center gap-1.5 text-xs font-medium px-1 ${cat.color.split(" ").filter(c => c.startsWith("text-")).join(" ")}`}>
-                {cat.icon}
-                <span>{cat.label}</span>
-              </div>
-              <div className="space-y-1.5">
-                {cat.examples.map((ex) => (
+        <button
+          ref={examplesTriggerRef}
+          type="button"
+          aria-expanded={isExamplesOpen}
+          aria-controls="welcome-example-library"
+          onClick={() => setIsExamplesOpen((open) => !open)}
+          className="mt-10 inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <span>{t("welcome.browseAllExamples" as any)}</span>
+          <ChevronDown
+            className={`h-4 w-4 transition-transform duration-300 ${isExamplesOpen ? "rotate-180" : ""}`}
+            aria-hidden="true"
+          />
+        </button>
+
+        <div
+          id="welcome-example-library"
+          aria-hidden={!isExamplesOpen}
+          onKeyDown={(event) => {
+            if (event.key !== "Escape" || !isExamplesOpen) return;
+            event.preventDefault();
+            event.stopPropagation();
+            setIsExamplesOpen(false);
+            examplesTriggerRef.current?.focus();
+          }}
+          className={`grid text-left transition-[grid-template-rows,opacity] duration-300 ease-out ${
+            isExamplesOpen
+              ? "grid-rows-[1fr] opacity-100"
+              : "grid-rows-[0fr] opacity-0"
+          }`}
+        >
+          <div className="min-h-0 overflow-hidden">
+            {/* One category at a time: a chip tab bar + that category's cards.
+                Rendering all 8 categories at once (grid or masonry) reads as
+                an unstructured wall — categories have uneven card counts. */}
+            <div className="pt-6">
+              <div
+                className="flex flex-wrap justify-center gap-1.5"
+                role="tablist"
+                aria-label={t("welcome.browseAllExamples" as any)}
+              >
+                {CATEGORIES.map((cat, index) => (
                   <button
-                    key={ex.title}
-                    onClick={() => onExample(ex.prompt)}
-                    className={`block w-full text-left px-3 py-2.5 rounded-xl border transition-colors ${cat.color}`}
+                    key={cat.labelKey}
+                    type="button"
+                    role="tab"
+                    aria-selected={index === activeCategory}
+                    tabIndex={isExamplesOpen ? 0 : -1}
+                    onClick={() => setActiveCategory(index)}
+                    className={
+                      index === activeCategory
+                        ? "inline-flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary"
+                        : "inline-flex items-center gap-1.5 rounded-full border border-transparent px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-border/60 hover:text-foreground"
+                    }
                   >
-                    <span className="text-sm font-medium text-foreground leading-snug">
-                      {ex.title}
+                    {cat.icon}
+                    <span>{t(cat.labelKey as any)}</span>
+                  </button>
+                ))}
+              </div>
+              <div role="tabpanel" className="mt-4 grid gap-2 text-left sm:grid-cols-2">
+                {CATEGORIES[activeCategory].examples.map((ex) => (
+                  <button
+                    key={ex.titleKey}
+                    type="button"
+                    tabIndex={isExamplesOpen ? 0 : -1}
+                    onClick={() => onExample(t(ex.promptKey as any))}
+                    className="block w-full rounded-xl border border-border/60 px-3 py-2.5 text-left transition-colors hover:border-primary/40 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                  >
+                    <span className="text-sm font-medium leading-snug text-foreground">
+                      {t(ex.titleKey as any)}
                     </span>
-                    <span className="block text-xs text-muted-foreground mt-0.5 leading-snug">
-                      {ex.desc}
+                    <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+                      {t(ex.descKey as any)}
                     </span>
                   </button>
                 ))}
               </div>
             </div>
-          ))}
+          </div>
         </div>
       </div>
     </div>

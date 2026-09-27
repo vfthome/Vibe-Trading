@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #95
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第95号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #95.
 
 Formula (paper appendix): rank(open-ts_min(open,13)) < Ts_Rank((rank(correlation(sum((high+low)/2,19), sum(adv40,19),13))^5), 12)
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['open', 'high', 'low', 'volume', 'close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 63,
@@ -65,4 +72,6 @@ def compute(panel: dict) -> pd.DataFrame:
     inner = signed_power(inner, 5.0)
     rhs = ts_rank(inner, 12)
     out = (lhs < rhs).astype(float)
-    return out
+    # Reach of each input through the nested windows; a gap inside it is not a verdict (#1463).
+    # volume: adv40 + sum 19 + corr 13 + ts_rank 12; high/low: sum 19 + corr 13 + ts_rank 12; open: ts_min 13.
+    return out.where(observed_over((volume, 81), (high, 42), (low, 42), (open_, 13)))

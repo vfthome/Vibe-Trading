@@ -14,6 +14,7 @@ Covers SPEC.md §9 Decision 1 (CLI surface table) and Consent §2/§4:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 import json
 from pathlib import Path
 from typing import Any, Dict
@@ -344,6 +345,95 @@ class TestLiveAuthorize:
         build.assert_called_once()
         assert build.call_args.args[0] == "robinhood"
 
+    def test_authorize_widens_tool_timeout_to_deadline(self) -> None:
+        """list_tools is bounded by tool_timeout, so authorize must widen it too.
+
+        Regression for #259: the OAuth flow is driven by the list_tools
+        handshake (per-call tool_timeout, default 30 s), not init_timeout. Both
+        must reach the 300 s authorize deadline.
+        """
+        from cli._legacy import cmd_live_authorize
+        from src.config.schema import MCPServerConfig
+
+        cfg = MCPServerConfig.model_validate(
+            {
+                "type": "streamableHttp",
+                "url": "https://agent.robinhood.com/mcp/trading",
+                "auth": {"type": "oauth", "scopes": ["trading.read"]},
+                "enabledTools": ["get_portfolio"],
+            }
+        )
+        with patch("cli._legacy._live_server_config", return_value=cfg), patch(
+            "src.tools.mcp.build_mcp_tool_wrappers", return_value=[1]
+        ) as build:
+            assert cmd_live_authorize("robinhood") == 0
+
+        passed_cfg = build.call_args.args[1]
+        assert cfg.tool_timeout == 30  # original unchanged
+        assert passed_cfg.init_timeout == 300
+        assert passed_cfg.tool_timeout == 300
+        # Single attempt: no retry that would orphan the OAuth callback.
+        assert build.call_args.kwargs["max_list_tools_attempts"] == 1
+
+    def test_authorize_preserves_larger_configured_tool_timeout(self) -> None:
+        """Raise-only: an already-larger configured timeout is not lowered."""
+        from cli._legacy import cmd_live_authorize
+        from src.config.schema import MCPServerConfig
+
+        cfg = MCPServerConfig.model_validate(
+            {
+                "type": "streamableHttp",
+                "url": "https://agent.robinhood.com/mcp/trading",
+                "auth": {"type": "oauth", "scopes": ["trading.read"]},
+                "enabledTools": ["get_portfolio"],
+                "toolTimeout": 600,
+                "initTimeout": 600,
+            }
+        )
+        with patch("cli._legacy._live_server_config", return_value=cfg), patch(
+            "src.tools.mcp.build_mcp_tool_wrappers", return_value=[1]
+        ) as build:
+            assert cmd_live_authorize("robinhood") == 0
+
+        passed_cfg = build.call_args.args[1]
+        assert passed_cfg.tool_timeout == 600
+        assert passed_cfg.init_timeout == 600
+
+    def test_authorize_honors_timeout_env_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """VIBE_LIVE_AUTHORIZE_TIMEOUT_SECONDS overrides the 300 s default."""
+        from cli._legacy import cmd_live_authorize
+        from src.config.schema import MCPServerConfig
+
+        monkeypatch.setenv("VIBE_LIVE_AUTHORIZE_TIMEOUT_SECONDS", "900")
+        cfg = MCPServerConfig.model_validate(
+            {
+                "type": "streamableHttp",
+                "url": "https://agent.robinhood.com/mcp/trading",
+                "auth": {"type": "oauth", "scopes": ["trading.read"]},
+                "enabledTools": ["get_portfolio"],
+            }
+        )
+        with patch("cli._legacy._live_server_config", return_value=cfg), patch(
+            "src.tools.mcp.build_mcp_tool_wrappers", return_value=[1]
+        ) as build:
+            assert cmd_live_authorize("robinhood") == 0
+
+        passed_cfg = build.call_args.args[1]
+        assert passed_cfg.tool_timeout == 900
+        assert passed_cfg.init_timeout == 900
+
+    @pytest.mark.parametrize("raw", ["", "abc", "0", "-5"])
+    def test_authorize_timeout_env_invalid_falls_back_to_default(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empty / non-numeric / non-positive env values fall back to 300 s."""
+        from cli._legacy import _authorize_timeout_seconds
+
+        monkeypatch.setenv("VIBE_LIVE_AUTHORIZE_TIMEOUT_SECONDS", raw)
+        assert _authorize_timeout_seconds() == 300.0
+
 
 # ---------------------------------------------------------------------------
 # REPL intercept helpers
@@ -378,12 +468,25 @@ class TestNumericPick:
 # ---------------------------------------------------------------------------
 
 
+class _AccountListing:
+    """Stands in for ``httpx.get`` on ``/live/accounts``."""
+
+    def __init__(self, payload: Dict[str, Any]) -> None:
+        self.payload = payload
+        self.calls: list[Dict[str, Any]] = []
+
+    def __call__(self, url: str, params: Dict[str, Any], headers: Dict[str, str], timeout: float):
+        assert url.endswith("/live/accounts")
+        self.calls.append(dict(params))
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: self.payload)
+
+
 def _proposal() -> Dict[str, Any]:
     return {
-        "proposal_id": "mp_test",
+        "proposal_id": "mp_" + "3" * 32,
         "session_id": "sess_1",
         "intent_normalized": "aggressive tech, ~$5000",
-        "account": {"broker": "robinhood", "type": "cash"},
+        "account": {"broker": "robinhood", "account_ref": "acct-demo", "type": "cash"},
         "profiles": [
             {"ordinal": 1, "label": "稳健", "max_order_usd": 250, "daily_trade_cap": 2},
             {"ordinal": 2, "label": "均衡", "max_order_usd": 750, "daily_trade_cap": 5},
@@ -404,7 +507,7 @@ class TestProposalPickIntercept:
         commit.assert_called_once()
         # The commit binds the exact rendered proposal + the picked ordinal.
         called_proposal, called_ordinal = commit.call_args.args
-        assert called_proposal["proposal_id"] == "mp_test"
+        assert called_proposal["proposal_id"] == "mp_" + "3" * 32
         assert called_ordinal == 2
         # Successful commit clears the pending proposal.
         assert ctx.pending_proposal is None
@@ -442,7 +545,9 @@ class TestProposalPickIntercept:
         assert handled is True
         assert ctx.pending_proposal is not None
 
-    def test_commit_posts_to_endpoint_with_consent_ack(self) -> None:
+    def test_commit_posts_to_endpoint_with_consent_ack(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """_commit_mandate POSTs to /mandate/commit — the surface, not the model."""
         captured: Dict[str, Any] = {}
 
@@ -453,19 +558,91 @@ class TestProposalPickIntercept:
             def json(self) -> Dict[str, Any]:
                 return {"status": "ok", "mandate_id": "m1"}
 
-        def _fake_post(url: str, json: Dict[str, Any], timeout: float) -> _Resp:  # noqa: A002
+        def _fake_post(
+            url: str,
+            json: Dict[str, Any],  # noqa: A002
+            headers: Dict[str, str],
+            timeout: float,
+        ) -> _Resp:
             captured["url"] = url
             captured["body"] = json
+            captured["headers"] = headers
             return _Resp()
 
-        with patch("httpx.post", _fake_post):
+        monkeypatch.setenv("API_AUTH_KEY", "cli-secret")
+        listing = _AccountListing({"account_selection_required": False, "accounts": []})
+        with patch("httpx.post", _fake_post), patch("httpx.get", listing):
             result = _commit_mandate(_proposal(), 2)
 
         assert result["mandate_id"] == "m1"
+        assert listing.calls == [{"broker": "robinhood"}]
         assert captured["url"].endswith("/mandate/commit")
         assert captured["body"]["selected_ordinal"] == 2
-        assert captured["body"]["proposal_id"] == "mp_test"
+        assert captured["body"]["proposal_id"] == "mp_" + "3" * 32
+        assert captured["body"]["broker"] == "robinhood"
+        assert captured["body"]["account_ref"] == "acct-demo"
         assert captured["body"]["consent_ack"] is True
+        assert captured["headers"] == {"Authorization": "Bearer cli-secret"}
+
+    def test_commit_rejects_missing_broker_before_network_call(self) -> None:
+        """The CLI validates the exact API request model before sending."""
+        proposal = _proposal()
+        proposal["account"] = {"type": "cash"}
+
+        with patch("httpx.post") as post, patch("httpx.get") as get:
+            result = _commit_mandate(proposal, 1)
+
+        assert result["status"] == "error"
+        assert "broker" in result["error"]
+        post.assert_not_called()
+        get.assert_not_called()
+
+    def test_an_account_bound_broker_commits_the_account_the_user_picks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The account comes from the user's pick, never from the proposal."""
+        rows = [
+            {"account_ref": "5QR12345", "label": "Main ····2345", "is_default": True, "agentic_allowed": True, "deactivated": False},
+        ]
+        seen: Dict[str, Any] = {}
+        posted: Dict[str, Any] = {}
+        listing = _AccountListing({"account_selection_required": True, "accounts": rows})
+
+        def _choose(accounts: list) -> str:
+            seen["accounts"] = accounts
+            return "5QR12345"
+
+        def _fake_post(url, json, headers, timeout):  # noqa: A002, ANN001
+            posted.update(json)
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"status": "ok", "mandate_id": "m2"})
+
+        monkeypatch.delenv("API_AUTH_KEY", raising=False)
+        with patch("httpx.post", _fake_post), patch("httpx.get", listing):
+            result = _commit_mandate(_proposal(), 1, choose_account=_choose)
+
+        assert result["mandate_id"] == "m2"
+        assert seen["accounts"] == rows
+        assert posted["account_ref"] == "5QR12345"  # not the proposal's "acct-demo"
+
+    def test_no_chosen_account_commits_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        listing = _AccountListing({"account_selection_required": True, "accounts": []})
+        with patch("httpx.post") as post, patch("httpx.get", listing):
+            result = _commit_mandate(_proposal(), 1, choose_account=lambda accounts: "")
+
+        assert result == {"status": "error", "error": "no account was chosen for this mandate"}
+        post.assert_not_called()
+
+    def test_the_default_chooser_offers_only_usable_accounts_and_preselects_nothing(self, monkeypatch) -> None:
+        rows = [
+            {"account_ref": "A1", "label": "Main", "is_default": True, "agentic_allowed": True, "deactivated": False},
+            {"account_ref": "A2", "label": "IRA", "is_default": False, "agentic_allowed": False, "deactivated": False},
+            {"account_ref": "A3", "label": "Old", "is_default": False, "agentic_allowed": True, "deactivated": True},
+            {"account_ref": "A4", "label": "Joint", "is_default": False, "agentic_allowed": True, "deactivated": False},
+        ]
+        replies = iter(["", "2", "9"])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(replies))
+
+        assert main._choose_mandate_account(rows) == ""  # an empty reply is not the default
+        assert main._choose_mandate_account(rows) == "A4"  # [1] Main, [2] Joint
+        assert main._choose_mandate_account(rows) == ""  # out of range
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +735,7 @@ class TestProposalArmingRelay:
         directly). Drives the event THROUGH the real ``on_event`` relay and
         asserts the full proposal is reloaded from disk into the sink.
         """
-        proposal_id = "mp_armtest01"
+        proposal_id = "mp_" + "4" * 32
         _write_proposal_to_disk(live_root, proposal_id)
 
         captured: Dict[str, Any] = {}
@@ -593,7 +770,7 @@ class TestProposalArmingRelay:
         ``_handle_proposal_reply`` and routed to the commit endpoint, NOT the
         agent.
         """
-        proposal_id = "mp_e2e01"
+        proposal_id = "mp_" + "5" * 32
         _write_proposal_to_disk(live_root, proposal_id)
 
         # 1) Arm through the real relay.

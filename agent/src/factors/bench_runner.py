@@ -17,10 +17,20 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
-from typing import Any, Callable
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Callable, Iterable
 
+import numpy as np
+
+from src.config.accessor import get_env_config
 from src.factors.factor_analysis_core import compute_ic_series
+from src.quantlib.multipletesting import (
+    MIN_OBSERVATIONS,
+    deflated_sharpe_ratio,
+    expected_maximum_sharpe,
+)
 from src.factors.registry import (
     Registry,
     RegistryError,
@@ -34,6 +44,60 @@ logger = logging.getLogger(__name__)
 
 ProgressCb = Callable[[int, int, str], None]
 """Signature: ``on_progress(n_done, n_total, current_alpha_id)``."""
+
+_WORKER_PANEL: dict[str, Any] | None = None
+_WORKER_RETURN_DF: Any | None = None
+
+
+def _init_bench_worker(panel: dict[str, Any], return_df: Any) -> None:
+    """Store large bench inputs once per worker process."""
+    global _WORKER_PANEL, _WORKER_RETURN_DF
+    _WORKER_PANEL = panel
+    _WORKER_RETURN_DF = return_df
+
+
+def _compute_single_alpha(args: Any) -> dict[str, Any]:
+    """Picklable worker for parallel bench.
+
+    Normal parallel execution passes only an alpha id after ``_init_bench_worker``
+    has stored the large panel and return matrix once per worker. The tuple
+    form is kept for direct unit tests and small one-off calls.
+    """
+    if isinstance(args, tuple):
+        alpha_id, panel, return_df = args
+    else:
+        alpha_id = str(args)
+        panel = _WORKER_PANEL
+        return_df = _WORKER_RETURN_DF
+        if panel is None or return_df is None:
+            return {"skip": {"id": alpha_id, "reason": "worker inputs not initialized", "kind": "unexpected"}}
+
+    reg = get_default_registry()
+    try:
+        factor_df = reg.compute(alpha_id, panel)
+        ic = compute_ic_series(factor_df, return_df)
+        if ic.empty:
+            return {"skip": {"id": alpha_id, "reason": "empty IC series", "kind": "typed"}}
+        ic_mean = float(ic.mean())
+        ic_std = float(ic.std())
+        ir = ic_mean / ic_std if ic_std > 0 else 0.0
+        meta = reg.get(alpha_id).meta or {}
+        return {
+            "row": {
+                "id": alpha_id,
+                "ic_mean": round(ic_mean, 6),
+                "ic_std": round(ic_std, 6),
+                "ir": round(ir, 4),
+                "ic_positive_ratio": round(float((ic > 0).mean()), 4),
+                "ic_count": int(len(ic)),
+                "theme": meta.get("theme", []),
+                "formula_latex": meta.get("formula_latex", ""),
+            }
+        }
+    except (SkipAlpha, RegistryError, RuntimeError, KeyError, ValueError) as exc:
+        return {"skip": {"id": alpha_id, "reason": str(exc), "kind": "typed"}}
+    except Exception as exc:  # noqa: BLE001
+        return {"skip": {"id": alpha_id, "reason": f"unexpected: {exc}", "kind": "unexpected"}}
 
 
 def t_stat(ic_mean: float, ic_std: float, n: int) -> float:
@@ -77,6 +141,7 @@ def run_bench(
     top: int = 20,
     on_progress: ProgressCb | None = None,
     registry: Registry | None = None,
+    only: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Run a bench end-to-end and return the API-shaped summary.
 
@@ -91,6 +156,10 @@ def run_bench(
             (success or skip). Signature: ``(n_done, n_total, alpha_id)``.
         registry: Optional pre-built registry (test injection); defaults to a
             fresh ``Registry()``.
+        only: Optional subset of alpha ids to evaluate. When provided, the zoo's
+            alpha list is restricted to this set — used by ``alpha compare`` to
+            bench just a handful of named alphas instead of the whole zoo. Ids
+            not registered under ``zoo`` are silently dropped from the subset.
 
     Returns:
         Dict with keys: ``status``, ``zoo``, ``universe``, ``period``,
@@ -114,6 +183,15 @@ def run_bench(
         entry["wall_seconds"] = round(time.monotonic() - start, 2)
         return entry
 
+    if only is not None:
+        only_set = {str(aid) for aid in only}
+        alpha_ids = [aid for aid in alpha_ids if aid in only_set]
+        if not alpha_ids:
+            entry["status"] = "error"
+            entry["error"] = f"none of the requested alphas are registered under zoo={zoo!r}"
+            entry["wall_seconds"] = round(time.monotonic() - start, 2)
+            return entry
+
     try:
         panel = _load_universe_panel(universe, period)
     except (ValueError, NotImplementedError, RuntimeError) as exc:
@@ -133,44 +211,97 @@ def run_bench(
     rows: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     n_total = len(alpha_ids)
-    for idx, aid in enumerate(alpha_ids, start=1):
-        try:
-            factor_df = reg.compute(aid, panel)
-            ic = compute_ic_series(factor_df, return_df)
-            if ic.empty:
-                skipped.append(
-                    {"id": aid, "reason": "empty IC series", "kind": "typed"}
-                )
-            else:
-                ic_mean = float(ic.mean())
-                ic_std = float(ic.std())
-                ir = ic_mean / ic_std if ic_std > 0 else 0.0
-                meta = reg.get(aid).meta or {}
-                rows.append(
-                    {
-                        "id": aid,
-                        "ic_mean": round(ic_mean, 6),
-                        "ic_std": round(ic_std, 6),
-                        "ir": round(ir, 4),
-                        "ic_positive_ratio": round(float((ic > 0).mean()), 4),
-                        "ic_count": int(len(ic)),
-                        "theme": meta.get("theme", []),
-                        "formula_latex": meta.get("formula_latex", ""),
-                    }
-                )
-        except (SkipAlpha, RegistryError, RuntimeError, KeyError, ValueError) as exc:
-            skipped.append({"id": aid, "reason": str(exc), "kind": "typed"})
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("bench: unexpected failure on %s", aid)
-            skipped.append(
-                {"id": aid, "reason": f"unexpected: {exc}", "kind": "unexpected"}
-            )
 
-        if on_progress is not None:
+    try:
+        n_workers = get_env_config().agent_tuning.vibe_trading_bench_workers or os.cpu_count() or 1
+    except ValueError:
+        logger.warning("invalid VIBE_TRADING_BENCH_WORKERS; falling back to sequential")
+        n_workers = 1
+    n_workers = max(1, min(n_workers, n_total))
+    use_parallel = registry is None and n_workers > 1 and n_total > 1
+
+    if use_parallel:
+        ctx_kwargs: dict[str, Any] = {}
+        try:
+            import multiprocessing
+
+            ctx = multiprocessing.get_context("fork")
+            ctx_kwargs["mp_context"] = ctx
+        except (ImportError, ValueError):
+            pass
+
+        future_to_id: dict[Any, str] = {}
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_bench_worker,
+            initargs=(panel, return_df),
+            **ctx_kwargs,
+        ) as pool:
+            for aid in alpha_ids:
+                fut = pool.submit(_compute_single_alpha, aid)
+                future_to_id[fut] = aid
+
+            n_done = 0
+            for fut in as_completed(future_to_id):
+                n_done += 1
+                aid = future_to_id[fut]
+                try:
+                    result = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("bench: worker crash on %s", aid)
+                    skipped.append({"id": aid, "reason": f"worker crash: {exc}", "kind": "unexpected"})
+                    result = None
+
+                if result is not None:
+                    if "row" in result:
+                        rows.append(result["row"])
+                    elif "skip" in result:
+                        skipped.append(result["skip"])
+
+                if on_progress is not None:
+                    try:
+                        on_progress(n_done, n_total, aid)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("on_progress callback raised; ignoring")
+    else:
+        for idx, aid in enumerate(alpha_ids, start=1):
             try:
-                on_progress(idx, n_total, aid)
-            except Exception:  # noqa: BLE001 — never let progress break the loop
-                logger.exception("on_progress callback raised; ignoring")
+                factor_df = reg.compute(aid, panel)
+                ic = compute_ic_series(factor_df, return_df)
+                if ic.empty:
+                    skipped.append(
+                        {"id": aid, "reason": "empty IC series", "kind": "typed"}
+                    )
+                else:
+                    ic_mean = float(ic.mean())
+                    ic_std = float(ic.std())
+                    ir = ic_mean / ic_std if ic_std > 0 else 0.0
+                    meta = reg.get(aid).meta or {}
+                    rows.append(
+                        {
+                            "id": aid,
+                            "ic_mean": round(ic_mean, 6),
+                            "ic_std": round(ic_std, 6),
+                            "ir": round(ir, 4),
+                            "ic_positive_ratio": round(float((ic > 0).mean()), 4),
+                            "ic_count": int(len(ic)),
+                            "theme": meta.get("theme", []),
+                            "formula_latex": meta.get("formula_latex", ""),
+                        }
+                    )
+            except (SkipAlpha, RegistryError, RuntimeError, KeyError, ValueError) as exc:
+                skipped.append({"id": aid, "reason": str(exc), "kind": "typed"})
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("bench: unexpected failure on %s", aid)
+                skipped.append(
+                    {"id": aid, "reason": f"unexpected: {exc}", "kind": "unexpected"}
+                )
+
+            if on_progress is not None:
+                try:
+                    on_progress(idx, n_total, aid)
+                except Exception:  # noqa: BLE001
+                    logger.exception("on_progress callback raised; ignoring")
 
     for row in rows:
         row["_category"] = categorise(row)
@@ -207,10 +338,60 @@ def run_bench(
         except Exception:  # noqa: BLE001
             universe_meta = {"raw": str(universe_meta_raw)}
 
+    # Multiple-testing correction. `n_alphas_tested` has always been carried
+    # here and has only ever been displayed; the best IR out of hundreds of
+    # searched alphas is the maximum of hundreds of draws, and under a null
+    # where none of them works that maximum is comfortably positive. The block
+    # below prices that. Every key is NEW -- nothing existing changes value, so
+    # no consumer of this dict is affected.
+    #
+    # Note on what is being deflated: `ir` here is mean(IC)/std(IC), not a
+    # return Sharpe. The deflation family applies to any max-of-N t-like
+    # statistic, but the resulting probability must be read as "this IC-IR
+    # survives the search", never as a statement about realised returns.
+    multiple_testing: dict[str, Any] = {"applicable": False}
+    if len(rows) >= 2:
+        ir_values = np.array([float(r["ir"]) for r in rows], dtype=float)
+        best_row = rows_by_ir[0]
+        best_ir = float(best_row["ir"])
+        ir_dispersion = float(ir_values.std(ddof=1))
+        observations = int(best_row.get("ic_count", 0))
+        expected_max = expected_maximum_sharpe(len(rows), ir_dispersion)
+        multiple_testing = {
+            "applicable": True,
+            "n_trials": len(rows),
+            "best_id": best_row["id"],
+            "best_ir": round(best_ir, 6),
+            "ir_dispersion": round(ir_dispersion, 6),
+            "expected_max_ir_under_null": round(expected_max, 6),
+            "ir_haircut": round(best_ir - expected_max, 6),
+            "ic_observations": observations,
+            "statistic": "ic_information_ratio",
+        }
+        if observations >= MIN_OBSERVATIONS:
+            deflated = deflated_sharpe_ratio(
+                observed_sharpe=best_ir,
+                n_trials=len(rows),
+                n_observations=observations,
+                trial_sharpe_std=ir_dispersion,
+            )
+            multiple_testing["deflated_probability"] = round(
+                deflated.deflated_sharpe_ratio, 6
+            )
+            multiple_testing["survives_deflation"] = deflated.survives
+        else:
+            multiple_testing["deflated_probability"] = None
+            multiple_testing["survives_deflation"] = None
+            multiple_testing["note"] = (
+                f"only {observations} IC observation(s); the deflated statistic "
+                f"needs at least {MIN_OBSERVATIONS} to mean anything"
+            )
+
     entry.update(
         {
             "status": "ok",
             "n_alphas_tested": len(rows),
+            "multiple_testing": multiple_testing,
             "n_skipped": len(skipped),
             "alive": counts["alive"],
             "reversed": counts["reversed"],

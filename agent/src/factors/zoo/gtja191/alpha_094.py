@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #94
+# 简要说明: 国泰君安191短周期交易型alpha因子第94号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha #94.
 
 Formula: SUM(CLOSE>DELAY(CLOSE,1)?VOLUME:(CLOSE<DELAY(CLOSE,1)?-VOLUME:0),30)
@@ -44,4 +50,6 @@ def compute(panel: dict) -> pd.DataFrame:
     v = panel["volume"]
     pc = c.shift(1)
     signed = v.where(c > pc, -v.where(c < pc, 0.0))
+    # A missing close, prior close or volume is not a flat day (#1463).
+    signed = signed.where(c.notna() & pc.notna() & v.notna())
     return signed.rolling(30, min_periods=30).sum()

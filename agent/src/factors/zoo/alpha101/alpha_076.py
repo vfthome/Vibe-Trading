@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #76
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第76号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #76.
 
 Formula (paper appendix): max(rank(decay_linear(delta(vwap,1),12)), Ts_Rank(decay_linear(Ts_Rank(correlation(IndNeutralize(low, sector), adv81, 8), 20), 17), 19)) * -1
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['low', 'volume', 'vwap', 'close'],
     'extras_required': [],
     'requires_sector': True,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 141,
@@ -88,7 +95,11 @@ def compute(panel: dict) -> pd.DataFrame:
     ind_neutralize = _ind_neutralize
     a = rank(decay_linear(delta(vwap, 1), 12))
     b = ts_rank(decay_linear(ts_rank(ts_corr(ind_neutralize(low, panel), adv81, 8), 20), 17), 19)
+    # np.fmax returns the other side when one is missing; mask where a gap sits
+    # inside an input's reach (#1463). A side that is undefined on complete data (a
+    # constant window's correlation) keeps the other side, as before (#1452).
+    # volume: adv81 + corr 8 + ts_rank 20 + decay 17 + ts_rank 19; low: the same without adv81; vwap: delta 1 + decay 12.
     arr_a = a.to_numpy(dtype=np.float64, na_value=np.nan)
     arr_b = b.to_numpy(dtype=np.float64, na_value=np.nan)
     out = pd.DataFrame(np.fmax(arr_a, arr_b), index=close.index, columns=close.columns) * -1.0
-    return out
+    return out.where(observed_over((volume, 141), (low, 61), (vwap, 13)))

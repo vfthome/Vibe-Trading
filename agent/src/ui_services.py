@@ -166,9 +166,11 @@ def infer_indicator_periods(run_dir: Path) -> List[int]:
     for key, value in signal_params.items():
         if "ma" in str(key).lower():
             try:
-                periods.add(int(value))
+                period = int(value)
             except (TypeError, ValueError):
                 continue
+            if period > 0:
+                periods.add(period)
 
     design = load_json_file(run_dir / "design_spec.json") or {}
     defaults = design.get("defaults_and_tunables") or {}
@@ -176,9 +178,11 @@ def infer_indicator_periods(run_dir: Path) -> List[int]:
     for key, value in assumptions.items():
         if "ma" in str(key).lower():
             try:
-                periods.add(int(value))
+                period = int(value)
             except (TypeError, ValueError):
                 continue
+            if period > 0:
+                periods.add(period)
 
     if not periods:
         return list(DEFAULT_ANALYSIS_PERIODS)
@@ -250,7 +254,10 @@ def collect_run_logs(run_dir: Path, line_limit: int = 200) -> List[Dict[str, Any
     return entries
 
 
-def build_trade_markers(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_trade_markers(
+    trades: List[Dict[str, Any]],
+    symbols: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
     """Normalize trade rows into frontend marker objects.
 
     Args:
@@ -261,6 +268,9 @@ def build_trade_markers(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     markers: List[Dict[str, Any]] = []
     for row in trades:
+        code = str(row.get("code") or "")
+        if symbols and code not in symbols:
+            continue
         side = str(row.get("side") or "").upper()
         timestamp = str(row.get("timestamp") or "")
         markers.append(
@@ -325,6 +335,8 @@ def build_indicator_series(
         closes = [float(row["close"]) for row in ordered_rows]
         code_series: Dict[str, List[Dict[str, Any]]] = {}
         for period in indicator_periods:
+            if period <= 0:
+                continue
             label = f"ma{period}"
             values: List[Dict[str, Any]] = []
             for index, row in enumerate(ordered_rows):
@@ -393,6 +405,37 @@ def load_price_series(run_dir: Path) -> List[Dict[str, Any]]:
     return reconstruct_price_series(run_dir)
 
 
+def load_chart_symbols(run_dir: Path, context: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Load chart symbol names without materializing all chart rows."""
+    artifacts = run_dir / "artifacts"
+    symbols: set[str] = set()
+
+    price_path = artifacts / "price_series.csv"
+    if price_path.exists():
+        try:
+            with price_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    code = str(row.get("code") or "").strip()
+                    if code:
+                        symbols.add(code)
+        except OSError:
+            symbols.clear()
+
+    if not symbols and artifacts.is_dir():
+        symbols.update(
+            file_path.stem.removeprefix("ohlcv_")
+            for file_path in artifacts.glob("ohlcv_*.csv")
+            if file_path.stem.removeprefix("ohlcv_")
+        )
+
+    if not symbols:
+        raw_codes = (context or load_run_context(run_dir)).get("codes") or []
+        symbols.update(str(code) for code in raw_codes if code)
+
+    return sorted(symbols)
+
+
 def reconstruct_price_series(run_dir: Path) -> List[Dict[str, Any]]:
     """Rebuild OHLC rows for a historical run using its generated loader.
 
@@ -413,7 +456,6 @@ def reconstruct_price_series(run_dir: Path) -> List[Dict[str, Any]]:
     if not signal_path.exists():
         return []
 
-    agent_root = Path(__file__).resolve().parents[1]
     try:
         from src.providers.llm import _ensure_dotenv
 
@@ -423,27 +465,34 @@ def reconstruct_price_series(run_dir: Path) -> List[Dict[str, Any]]:
     fetch_start_date = _compute_fetch_start_date(run_dir, start_date)
 
     try:
-        source = context.get("source", "tushare")
-        if source == "okx":
-            from backtest.loaders.okx import DataLoader
-        elif source == "yfinance":
-            from backtest.loaders.yfinance_loader import DataLoader
-        else:
-            from backtest.loaders.tushare import DataLoader
-        loader = DataLoader()
-        data_map = loader.fetch(codes, fetch_start_date, end_date)
+        config_data = load_json_file(run_dir / "config.json") or {}
+        from backtest.runner import fetch_data_map
+
+        fetch_config = dict(config_data)
+        fetch_config.update(
+            codes=codes,
+            start_date=fetch_start_date,
+            end_date=end_date,
+        )
+        data_map = fetch_data_map(fetch_config).data_map
     except Exception as exc:
         print(f"[WARN] reconstruct_price_series: DataLoader failed ({exc})")
         return []
 
     if not data_map:
-        print(f"[WARN] reconstruct_price_series: DataLoader returned empty")
+        print("[WARN] reconstruct_price_series: DataLoader returned empty")
         return []
 
     return _flatten_data_map(data_map, start_date=start_date)
 
 
-def build_run_analysis(run_dir: Path) -> Dict[str, Any]:
+def build_run_analysis(
+    run_dir: Path,
+    symbols: Optional[List[str]] = None,
+    *,
+    include_payload: bool = True,
+    include_symbol_list: bool = False,
+) -> Dict[str, Any]:
     """Build the analysis payload consumed by the run detail page.
 
     Args:
@@ -452,16 +501,36 @@ def build_run_analysis(run_dir: Path) -> Dict[str, Any]:
     Returns:
         A serializable dictionary of chart, trade, and log data.
     """
+    context = load_run_context(run_dir)
+    chart_symbols = load_chart_symbols(run_dir, context) if include_symbol_list or not include_payload else []
+
+    if not include_payload:
+        return {
+            "run_stage": infer_run_stage(run_dir),
+            "run_context": context,
+            "chart_symbols": chart_symbols,
+            "price_series": {},
+            "indicator_series": {},
+            "trade_markers": [],
+            "run_logs": collect_run_logs(run_dir),
+        }
+
     price_rows = load_price_series(run_dir)
+    if include_symbol_list and not chart_symbols:
+        chart_symbols = sorted({str(row.get("code") or "") for row in price_rows if row.get("code")})
+    selected_symbols = {symbol for symbol in (symbols or []) if symbol}
+    if selected_symbols:
+        price_rows = [row for row in price_rows if str(row.get("code") or "") in selected_symbols]
     periods = infer_indicator_periods(run_dir)
     trades = load_csv_records(run_dir / "artifacts" / "trades.csv")
 
     return {
         "run_stage": infer_run_stage(run_dir),
-        "run_context": load_run_context(run_dir),
+        "run_context": context,
+        "chart_symbols": chart_symbols,
         "price_series": group_price_rows(price_rows),
         "indicator_series": build_indicator_series(price_rows, periods) if price_rows else {},
-        "trade_markers": build_trade_markers(trades),
+        "trade_markers": build_trade_markers(trades, selected_symbols or None),
         "run_logs": collect_run_logs(run_dir),
     }
 

@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #49 - 指数平滑量比
+# 简要说明: SUM((HIGH+LOW+CLOSE+OPEN)*0.25*VOLUME,12)/SUM(VOLUME,12)，12日成交量加权的平均价格。
+# 典型用途: 量价加权平均价格，反映资金流动的方向和力度。
+# ============================================================
 """GTJA Alpha #49.
 
 Formula: SUM(((HIGH+LOW)>=(DELAY(HIGH,1)+DELAY(LOW,1))?0:MAX(ABS(HIGH-DELAY(HIGH,1)),ABS(LOW-DELAY(LOW,1)))),12)/(SUM(...,12)+SUM(...,12))
@@ -49,8 +55,10 @@ def compute(panel: dict) -> pd.DataFrame:
                    np.abs(l.to_numpy() - l.shift(1).to_numpy())),
         index=h.index, columns=h.columns,
     )
-    dn = move.where(hl < phl, 0.0)
-    up = move.where(hl > phl, 0.0)
+    # A missing high/low today or yesterday is neither an up nor a down move (#1463).
+    valid = hl.notna() & phl.notna() & move.notna()
+    dn = move.where(hl < phl, 0.0).where(valid)
+    up = move.where(hl > phl, 0.0).where(valid)
     s_dn = dn.rolling(12, min_periods=12).sum()
     s_up = up.rolling(12, min_periods=12).sum()
     return safe_div(s_dn, s_dn + s_up)

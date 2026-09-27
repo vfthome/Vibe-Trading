@@ -8,20 +8,30 @@ and the service dispatch degrading cleanly when nothing is configured.
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import pytest
 
+from backtest.loaders import longbridge as longbridge_loader
 from src.live.classification import ToolClass
+from src.trading.connectors.longbridge import credentials as lb_credentials
 from src.trading import profiles, service
 from src.trading.connectors.alpaca import sdk as al
 from src.trading.connectors.alpaca.classification import ALPACA_TOOL_CLASS
 from src.trading.connectors.binance import sdk as bn
 from src.trading.connectors.binance.classification import BINANCE_TOOL_CLASS
+from src.trading.connectors.dhan import sdk as dh
+from src.trading.connectors.dhan.classification import DHAN_TOOL_CLASS
 from src.trading.connectors.futu import sdk as ft
 from src.trading.connectors.futu.classification import FUTU_TOOL_CLASS
 from src.trading.connectors.longbridge import sdk as lb
 from src.trading.connectors.longbridge.classification import LONGBRIDGE_TOOL_CLASS
 from src.trading.connectors.okx import sdk as ox
 from src.trading.connectors.okx.classification import OKX_TOOL_CLASS
+from src.trading.connectors.shoonya import sdk as sh
+from src.trading.connectors.shoonya.classification import SHOONYA_TOOL_CLASS
+from src.trading.connectors.etoro import client as etoro_client
 from src.trading.connectors.tiger import sdk as tg
 from src.trading.connectors.tiger.classification import TIGER_TOOL_CLASS
 
@@ -34,7 +44,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_sdk_profiles_registered() -> None:
-    """All six broker connectors register paper and read-only live profiles."""
+    """All broker connectors register paper and read-only live profiles."""
     ids = {p.id for p in profiles.list_profiles()}
     assert {
         "tiger-paper-sdk", "tiger-live-sdk-readonly",
@@ -43,7 +53,27 @@ def test_sdk_profiles_registered() -> None:
         "okx-paper-sdk", "okx-live-sdk-readonly",
         "binance-paper-sdk", "binance-live-sdk-readonly",
         "futu-paper-sdk", "futu-live-sdk-readonly",
+        "dhan-paper-sdk", "dhan-live-sdk-readonly",
+        "shoonya-paper-sdk", "shoonya-live-sdk-readonly",
+        "etoro-paper-sdk", "etoro-paper-trade",
+        "etoro-live-sdk-readonly", "etoro-live-trade",
+        "kis-paper-sdk", "kis-paper-trade", "kis-live-sdk-readonly",
+        "upbit-paper-sdk", "upbit-paper-trade", "upbit-live-sdk-readonly",
+        "toss-live-sdk-readonly",
     } <= ids
+
+
+def test_no_discriminator_brokers_expose_no_live_trade_profile() -> None:
+    """Brokers without a runtime paper/live discriminator (Longbridge, Dhan,
+    Shoonya) must NOT register any live order-placing profile — the Longbridge
+    precedent. A ``*-live-trade`` profile here would be a red-line regression."""
+    ids = {p.id for p in profiles.list_profiles()}
+    for broker in ("longbridge", "dhan", "shoonya", "upbit"):
+        assert f"{broker}-live-trade" not in ids
+        # No live profile for these brokers may advertise an order capability.
+        for p in profiles.list_profiles():
+            if p.connector == broker and p.environment == "live":
+                assert not any(".place" in cap or "requires_mandate" in cap for cap in p.capabilities)
 
 
 @pytest.mark.parametrize(
@@ -61,6 +91,12 @@ def test_sdk_profiles_registered() -> None:
         ("binance-live-sdk-readonly", "binance", "live"),
         ("futu-paper-sdk", "futu", "paper"),
         ("futu-live-sdk-readonly", "futu", "live"),
+        ("dhan-paper-sdk", "dhan", "paper"),
+        ("dhan-live-sdk-readonly", "dhan", "live"),
+        ("shoonya-paper-sdk", "shoonya", "paper"),
+        ("shoonya-live-sdk-readonly", "shoonya", "live"),
+        ("etoro-paper-sdk", "etoro", "paper"),
+        ("etoro-live-sdk-readonly", "etoro", "live"),
     ],
 )
 def test_sdk_profiles_are_readonly_broker_sdk(profile_id, connector, environment) -> None:
@@ -131,7 +167,14 @@ def test_tiger_invalid_profile_rejected() -> None:
 
 
 def test_longbridge_build_config_and_region(monkeypatch, tmp_path) -> None:
+    for env_name in (
+        "LONGBRIDGE_APP_KEY",
+        "LONGBRIDGE_APP_SECRET",
+        "LONGBRIDGE_ACCESS_TOKEN",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(lb, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(lb_credentials, "get_runtime_root", lambda: tmp_path)
     cfg = lb.build_config({"profile": "live-readonly", "region": "cn"}, None)
     assert cfg.profile == "live-readonly"
     assert cfg.region == "cn"
@@ -142,15 +185,190 @@ def test_longbridge_invalid_region_rejected() -> None:
         lb.LongbridgeConfig.from_mapping({"region": "moon"})
 
 
+def test_longbridge_with_overrides_preserves_atomic_credentials() -> None:
+    cfg = lb.LongbridgeConfig(
+        app_key="atomic-key",
+        app_secret="atomic-secret",
+        access_token="atomic-token",
+        _credential_source="environment",
+    )
+
+    updated = cfg.with_overrides(
+        app_key="ignored-key", profile="live-readonly", region="cn"
+    )
+
+    assert (updated.app_key, updated.app_secret, updated.access_token) == (
+        "atomic-key",
+        "atomic-secret",
+        "atomic-token",
+    )
+    assert updated._credential_source == "environment"
+    assert updated.profile == "live-readonly"
+    assert updated.region == "cn"
+
+
 def test_longbridge_public_config_redacts_secrets() -> None:
-    """Secret material must never appear in a status payload."""
-    cfg = lb.LongbridgeConfig(app_key="abcd1234", app_secret="supersecret", access_token="tok-123")
+    """Secret material must never appear in status payloads or config reprs."""
+    values = {
+        "app_key": "repr-distinctive-app-key-7f31",
+        "app_secret": "repr-distinctive-app-secret-8a42",
+        "access_token": "repr-distinctive-access-token-9b53",
+    }
+    cfg = lb.LongbridgeConfig(**values)
     pub = lb._public_config(cfg)
     assert pub["app_secret"] == "***redacted***"
     assert pub["access_token"] == "***redacted***"
-    assert "supersecret" not in str(pub)
-    assert "tok-123" not in str(pub)
     assert pub["app_key"].endswith("***")
+    assert all(value not in repr(cfg) for value in values.values())
+    assert all(value not in repr(pub) for value in values.values())
+
+
+def _set_longbridge_environment(monkeypatch, values) -> None:
+    for field, env_name in {
+        "app_key": "LONGBRIDGE_APP_KEY",
+        "app_secret": "LONGBRIDGE_APP_SECRET",
+        "access_token": "LONGBRIDGE_ACCESS_TOKEN",
+    }.items():
+        monkeypatch.setenv(env_name, values[field])
+
+
+def test_connector_uses_environment_credentials(monkeypatch, tmp_path) -> None:
+    values = {
+        "app_key": "connector-environment-key",
+        "app_secret": "connector-environment-secret",
+        "access_token": "connector-environment-token",
+    }
+    _set_longbridge_environment(monkeypatch, values)
+    monkeypatch.setattr(lb, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(lb_credentials, "get_runtime_root", lambda: tmp_path)
+
+    cfg = lb.build_config({"profile": "live-readonly", "region": "cn"}, None)
+
+    assert (cfg.app_key, cfg.app_secret, cfg.access_token) == tuple(values.values())
+    assert cfg.profile == "live-readonly"
+    assert cfg.region == "cn"
+    monkeypatch.setattr(lb, "longbridge_available", lambda: False)
+    assert lb.check_status(cfg)["credential_source"] == "environment"
+
+
+def test_loader_and_connector_resolve_same_source(monkeypatch, tmp_path) -> None:
+    values = {
+        "app_key": "shared-file-key",
+        "app_secret": "shared-file-secret",
+        "access_token": "shared-file-token",
+    }
+    for env_name in (
+        "LONGBRIDGE_APP_KEY",
+        "LONGBRIDGE_APP_SECRET",
+        "LONGBRIDGE_ACCESS_TOKEN",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    (tmp_path / "longbridge.json").write_text(json.dumps(values), encoding="utf-8")
+    monkeypatch.setattr(lb, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(lb_credentials, "get_runtime_root", lambda: tmp_path)
+
+    connector = lb.build_config()
+    loader = longbridge_loader.LongbridgeLoader()
+
+    assert (connector.app_key, connector.app_secret, connector.access_token) == (
+        loader._app_key,
+        loader._app_secret,
+        loader._access_token,
+    )
+    monkeypatch.setattr(lb, "longbridge_available", lambda: False)
+    assert lb.check_status(connector)["credential_source"] == "runtime_file"
+    assert loader._credential_source == "runtime_file"
+
+
+def test_connector_reports_conflict_without_sdk_call(monkeypatch, tmp_path) -> None:
+    environment = {
+        "app_key": "conflict-environment-key",
+        "app_secret": "conflict-environment-secret",
+        "access_token": "conflict-environment-token",
+    }
+    runtime_file = {
+        "app_key": "conflict-file-key",
+        "app_secret": "conflict-file-secret",
+        "access_token": "conflict-file-token",
+    }
+    _set_longbridge_environment(monkeypatch, environment)
+    (tmp_path / "longbridge.json").write_text(json.dumps(runtime_file), encoding="utf-8")
+    monkeypatch.setattr(lb, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(lb_credentials, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        lb,
+        "_trade_context",
+        lambda cfg: (_ for _ in ()).throw(AssertionError("SDK must not initialize")),
+    )
+
+    report = lb.check_status(lb.build_config())
+
+    assert report["configured"] is False
+    assert report["connection_state"] == "error"
+    assert report["credential_source"] is None
+    assert report["error_code"] == "credentials_conflict"
+    assert all(
+        field in report["error"]
+        for field in ("app_key", "app_secret", "access_token")
+    )
+    with pytest.raises(lb.LongbridgeConfigError, match="sources conflict"):
+        lb._require_resolved_config(lb.build_config())
+
+
+def test_connector_status_redacts_credentials(monkeypatch, tmp_path) -> None:
+    values = {
+        "app_key": "status-sensitive-key",
+        "app_secret": "status-sensitive-secret",
+        "access_token": "status-sensitive-token",
+    }
+    secret_exception = RuntimeError(
+        "authentication failed for " + "/".join(values.values())
+    )
+    _set_longbridge_environment(monkeypatch, values)
+    monkeypatch.setattr(lb, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(lb_credentials, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(lb, "longbridge_available", lambda: True)
+    monkeypatch.setattr(
+        lb,
+        "_trade_context",
+        lambda cfg: SimpleNamespace(
+            account_balance=lambda: (_ for _ in ()).throw(secret_exception)
+        ),
+    )
+
+    report = lb.check_status(lb.build_config())
+    serialized = str(report)
+
+    assert report["configured"] is True
+    assert report["connection_state"] == "error"
+    assert report["error_code"] == "authentication_failed"
+    assert report["error"] == "Longbridge authentication failed."
+    assert all(value not in serialized for value in values.values())
+    assert report["error"].__class__ is str
+    assert secret_exception not in _exception_chain_from_payload(report)
+
+
+def _exception_chain_from_payload(payload) -> tuple[BaseException, ...]:
+    """Return exceptions publicly reachable from a returned payload."""
+    seen: set[int] = set()
+    found: list[BaseException] = []
+    pending = list(payload.values()) if isinstance(payload, dict) else [payload]
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, BaseException):
+            found.append(value)
+            if value.__cause__ is not None:
+                pending.append(value.__cause__)
+            if value.__context__ is not None:
+                pending.append(value.__context__)
+        elif isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple, set)):
+            pending.extend(value)
+    return tuple(found)
 
 
 # --------------------------------------------------------------------------- #
@@ -187,11 +405,29 @@ def test_service_check_connection_unconfigured_tiger(monkeypatch, tmp_path) -> N
 
 
 def test_service_check_connection_unconfigured_longbridge(monkeypatch, tmp_path) -> None:
+    for env_name in (
+        "LONGBRIDGE_APP_KEY",
+        "LONGBRIDGE_APP_SECRET",
+        "LONGBRIDGE_ACCESS_TOKEN",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(lb, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(lb_credentials, "get_runtime_root", lambda: tmp_path)
     result = service.check_connection("longbridge-paper-sdk")
     assert result["status"] == "error"
     assert "not configured" in result["error"]
     assert result["connector"] == "longbridge"
+    assert result["transport"] == "broker_sdk"
+
+
+def test_service_check_connection_unconfigured_etoro(monkeypatch, tmp_path) -> None:
+    for env_name in ("ETORO_API_KEY", "ETORO_USER_KEY"):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(etoro_client, "get_runtime_root", lambda: tmp_path)
+    result = service.check_connection("etoro-paper-sdk")
+    assert result["status"] == "error"
+    assert "not configured" in result["error"]
+    assert result["connector"] == "etoro"
     assert result["transport"] == "broker_sdk"
 
 
@@ -282,6 +518,91 @@ def test_binance_classification() -> None:
     assert BINANCE_TOOL_CLASS["create_order"] is ToolClass.WRITE
     assert BINANCE_TOOL_CLASS["cancel_order"] is ToolClass.WRITE
     assert BINANCE_TOOL_CLASS["fetch_balance"] is ToolClass.READ
+    assert BINANCE_TOOL_CLASS["load_markets"] is ToolClass.READ
+
+
+def test_binance_search_instruments_resolves_exact_active_spot_pair(monkeypatch) -> None:
+    class FakeExchange:
+        def load_markets(self):
+            return {
+                "ETH/USDT": {
+                    "id": "ETHUSDT",
+                    "symbol": "ETH/USDT",
+                    "spot": True,
+                    "active": True,
+                },
+                "ETH/USDT:USDT": {
+                    "id": "ETHUSDT",
+                    "symbol": "ETH/USDT:USDT",
+                    "spot": False,
+                    "active": True,
+                },
+                "BTC/USDT": {
+                    "id": "BTCUSDT",
+                    "symbol": "BTC/USDT",
+                    "spot": True,
+                    "active": True,
+                },
+            }
+
+    monkeypatch.setattr(bn, "_exchange", lambda _cfg: FakeExchange())
+
+    result = bn.search_instruments(
+        "ETHUSDT",
+        config=bn.BinanceConfig(profile="paper"),
+    )
+
+    assert result == {
+        "status": "ok",
+        "query": "ETHUSDT",
+        "instruments": [
+            {
+                "symbol": "ETH-USDT",
+                "native_symbol": "ETH/USDT",
+                "exchange_symbol": "ETHUSDT",
+                "base": "ETH",
+                "quote": "USDT",
+                "market": "crypto",
+                "type": "cryptocurrency",
+                "exchange": "BINANCE",
+                "active": True,
+            }
+        ],
+    }
+
+
+def test_binance_search_instruments_does_not_guess_prose(monkeypatch) -> None:
+    def _unexpected_exchange(_cfg):
+        raise AssertionError("prose lookup must not load the Binance market catalog")
+
+    monkeypatch.setattr(bn, "_exchange", _unexpected_exchange)
+
+    result = bn.search_instruments(
+        "Ethereum",
+        config=bn.BinanceConfig(profile="paper"),
+    )
+
+    assert result == {"status": "ok", "query": "Ethereum", "instruments": []}
+
+
+def test_service_routes_instrument_search_to_selected_binance_profile(monkeypatch) -> None:
+    captured = {}
+
+    def _search(query, *, config, limit):
+        captured.update(query=query, profile=config.profile, limit=limit)
+        return {"status": "ok", "instruments": [{"symbol": "ETH-USDT"}]}
+
+    monkeypatch.setattr(bn, "search_instruments", _search)
+
+    result = service.search_instruments(
+        "ETH-USDT",
+        "binance-paper-trade",
+        limit=3,
+    )
+
+    assert captured == {"query": "ETH-USDT", "profile": "paper", "limit": 3}
+    assert result["profile_id"] == "binance-paper-trade"
+    assert result["connector"] == "binance"
 
 
 def test_binance_service_unconfigured(monkeypatch, tmp_path) -> None:
@@ -289,6 +610,57 @@ def test_binance_service_unconfigured(monkeypatch, tmp_path) -> None:
     result = service.check_connection("binance-paper-sdk")
     assert result["status"] == "error"
     assert result["connector"] == "binance"
+
+
+def test_binance_positions_replace_ld_wrappers_with_simple_earn(monkeypatch) -> None:
+    class FakeExchange:
+        def fetch_balance(self):
+            return {
+                "USDT": {"free": 12, "used": 0, "total": 12},
+                "LDBTC": {"free": 0, "used": 0.9, "total": 0.9},
+            }
+
+        def sapi_get_simple_earn_flexible_position(self, params):
+            assert params == {"size": 100}
+            return {"rows": [{"asset": "BTC", "totalAmount": "1.0"}]}
+
+    monkeypatch.setattr(bn, "_exchange", lambda _cfg: FakeExchange())
+    result = bn.get_positions(
+        bn.BinanceConfig(api_key="key", api_secret="secret", profile="live-readonly")
+    )
+
+    assert result["positions"] == [
+        {"symbol": "USDT", "quantity": 12.0, "free": 12.0, "used": 0.0, "source": "spot"},
+        {
+            "symbol": "BTC",
+            "quantity": 1.0,
+            "free": 0.0,
+            "used": 1.0,
+            "source": "simple_earn_flexible",
+        },
+    ]
+
+
+def test_binance_exchange_adjusts_for_server_time(monkeypatch) -> None:
+    captured = {}
+
+    class FakeExchange:
+        def __init__(self, config):
+            captured.update(config)
+
+        def set_sandbox_mode(self, enabled):
+            captured["sandbox"] = enabled
+
+    monkeypatch.setattr(bn, "_require_ccxt", lambda: SimpleNamespace(binance=FakeExchange))
+    monkeypatch.setattr(bn, "getproxies", lambda: {})
+
+    bn._exchange(bn.BinanceConfig(api_key="key", api_secret="secret", profile="live-readonly"))
+
+    assert captured["options"] == {
+        "adjustForTimeDifference": True,
+        "recvWindow": 10_000,
+    }
+    assert captured["sandbox"] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +730,8 @@ def test_okx_invalid_profile_rejected() -> None:
         ("okx", "place_order"),
         ("binance", "create_order"),
         ("futu", "place_order"),
+        ("dhan", "place_order"),
+        ("shoonya", "place_order"),
     ],
 )
 def test_order_ops_write_pinned_via_registry(broker, order_op) -> None:
@@ -461,3 +835,150 @@ def test_okx_history_maps_candles_and_period(monkeypatch) -> None:
     assert len(out["bars"]) == 1
     bar = out["bars"][0]
     assert bar["open"] == "100" and bar["close"] == "105" and bar["confirm"] == "1"
+
+
+# --------------------------------------------------------------------------- #
+# Dhan + Shoonya: structural paper-only cap (no runtime discriminator)
+#
+# Like Longbridge, these brokers expose no sandbox / no runtime paper/live
+# discriminator (same token/login reaches the same real account). The order
+# path is therefore structurally capped at paper: any non-paper config is
+# refused at the first line, so a flipped ``profile`` override can never reach a
+# live order. Paper orders are simulated locally (neither broker has a sandbox).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("mod, Config", [(dh, dh.DhanConfig), (sh, sh.ShoonyaConfig)])
+@pytest.mark.parametrize("profile", ["live", "live-readonly"])
+def test_in_broker_place_order_refuses_non_paper(mod, Config, profile) -> None:
+    """A non-paper config is refused before any SDK call (fail-closed)."""
+    result = mod.place_order(Config(profile=profile), symbol="RELIANCE", side="buy", quantity=1)
+    assert result["status"] == "error"
+    assert "paper-only" in result["error"]
+
+
+@pytest.mark.parametrize("mod, Config", [(dh, dh.DhanConfig), (sh, sh.ShoonyaConfig)])
+def test_in_broker_cancel_order_refuses_non_paper(mod, Config) -> None:
+    result = mod.cancel_order(Config(profile="live"), "ORD1")
+    assert result["status"] == "error"
+    assert "paper-only" in result["error"]
+
+
+@pytest.mark.parametrize("mod, Config", [(dh, dh.DhanConfig), (sh, sh.ShoonyaConfig)])
+def test_in_broker_paper_place_order_simulated_locally(mod, Config) -> None:
+    """Paper config simulates locally — no real money, no SDK call."""
+    result = mod.place_order(Config(profile="paper"), symbol="RELIANCE", side="buy", quantity=10)
+    assert result["status"] == "ok"
+    assert result["is_paper"] is True
+    assert result["order_status"] == "simulated_fill"
+    assert result["paper_guard"] == "simulated_locally"
+
+
+@pytest.mark.parametrize("quantity", [0.5, 1.5, "1.5", "1.00000000000000001"])
+def test_dhan_place_order_rejects_fractional_quantity(quantity) -> None:
+    """A fractional quantity must not silently truncate to a zero-share fill.
+
+    Before the fix, ``int(0.5)`` truncated to 0 after the ``> 0`` check had
+    already passed, so a fractional order came back ``status: ok`` with
+    ``quantity: 0`` — a fabricated successful fill for zero shares.
+    """
+    result = dh.place_order(
+        dh.DhanConfig(profile="paper"), symbol="RELIANCE", side="buy", quantity=quantity
+    )
+    assert result["status"] == "error"
+    assert "whole number" in result["error"]
+
+
+@pytest.mark.parametrize("quantity", [None, 0, -1, "invalid", "", True, [], float("nan"), float("inf"), "-Infinity"])
+def test_dhan_invalid_quantity_returns_an_error(quantity) -> None:
+    result = dh.place_order(
+        dh.DhanConfig(profile="paper"), symbol="RELIANCE", side="buy", quantity=quantity,
+    )
+
+    assert result["status"] == "error"
+    assert "quantity" in result["error"]
+    assert "order_id" not in result
+
+
+@pytest.mark.parametrize("quantity,expected", [(1, 1), (2.0, 2), ("3.0", 3), ("9007199254740993", 9007199254740993)])
+def test_dhan_whole_quantity_is_preserved_in_the_paper_fill(quantity, expected) -> None:
+    result = dh.place_order(
+        dh.DhanConfig(profile="paper"), symbol="RELIANCE", side="buy", quantity=quantity,
+    )
+
+    assert result["status"] == "ok"
+    assert result["quantity"] == expected
+    assert result["paper_guard"] == "simulated_locally"
+
+
+@pytest.mark.parametrize("mod, Config", [(dh, dh.DhanConfig), (sh, sh.ShoonyaConfig)])
+def test_in_broker_paper_cancel_order_simulated(mod, Config) -> None:
+    placed = mod.place_order(Config(profile="paper"), symbol="RELIANCE", side="buy", quantity=10)
+    result = mod.cancel_order(Config(profile="paper"), placed["order_id"])
+    assert result["status"] == "ok"
+    assert result["cancelled"] is True
+    assert result["is_paper"] is True
+
+
+@pytest.mark.parametrize("mod, Config", [(dh, dh.DhanConfig), (sh, sh.ShoonyaConfig)])
+def test_in_broker_paper_cancel_refuses_an_order_it_never_issued(mod, Config) -> None:
+    """The paper profile reads the real account, so a live order id can reach
+    the simulated cancel; acknowledging it would report a cancel that never
+    happened while the real order keeps working."""
+    result = mod.cancel_order(Config(profile="paper"), "ORD1")
+    assert result["status"] == "error"
+    assert "cancelled" not in result
+    assert "not issued by this paper simulator" in result["error"]
+
+
+def test_in_broker_order_ops_classified_write() -> None:
+    for name in ("place_order", "modify_order", "cancel_order"):
+        assert DHAN_TOOL_CLASS[name] is ToolClass.WRITE
+        assert SHOONYA_TOOL_CLASS[name] is ToolClass.WRITE
+    for name in ("get_positions", "get_holdings"):
+        assert DHAN_TOOL_CLASS[name] is ToolClass.READ
+        assert SHOONYA_TOOL_CLASS[name] is ToolClass.READ
+
+
+def test_dhan_redacts_access_token() -> None:
+    cfg = dh.DhanConfig(client_id="C1", access_token="tok-abcdefgh-secret")
+    pub = dh._public_config(cfg)
+    assert "secret" not in str(pub)
+    assert pub["access_token"].endswith("***")
+
+
+def test_shoonya_redacts_secrets() -> None:
+    cfg = sh.ShoonyaConfig(
+        user_id="USER1", password="pw", vendor_code="V", api_secret="sec", totp_secret="totp"
+    )
+    pub = sh._public_config(cfg)
+    for secret in ("password", "api_secret", "totp_secret"):
+        assert pub[secret] == "***redacted***"
+    assert "sec" not in str(pub) or pub["api_secret"] == "***redacted***"
+    assert pub["user_id"].endswith("***")
+
+
+def test_dhan_invalid_profile_rejected() -> None:
+    with pytest.raises(dh.DhanConfigError):
+        dh.DhanConfig.from_mapping({"profile": "go-live"})
+
+
+def test_shoonya_invalid_profile_rejected() -> None:
+    with pytest.raises(sh.ShoonyaConfigError):
+        sh.ShoonyaConfig.from_mapping({"profile": "go-live"})
+
+
+def test_dhan_service_unconfigured(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(dh, "get_runtime_root", lambda: tmp_path)
+    result = service.check_connection("dhan-paper-sdk")
+    assert result["status"] == "error"
+    assert result["connector"] == "dhan"
+    assert result["transport"] == "broker_sdk"
+
+
+def test_shoonya_service_unconfigured(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(sh, "get_runtime_root", lambda: tmp_path)
+    result = service.check_connection("shoonya-paper-sdk")
+    assert result["status"] == "error"
+    assert result["connector"] == "shoonya"
+    assert result["transport"] == "broker_sdk"

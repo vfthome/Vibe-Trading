@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #68
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第68号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #68.
 
 Formula (paper appendix): (Ts_Rank(correlation(rank(high), rank(adv15), 9), 14) < rank(delta(0.518*close+0.482*low, 1))) * -1
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['high', 'low', 'close', 'volume'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 36,
@@ -58,4 +65,6 @@ def compute(panel: dict) -> pd.DataFrame:
     mix = close * 0.518371 + low * (1.0 - 0.518371)
     rhs = rank(delta(mix, 1))
     out = (lhs < rhs).astype(float) * -1.0
-    return out
+    # Reach of each input through the nested windows; a gap inside it is not a verdict (#1463).
+    # volume: adv15 + corr 9 + ts_rank 14; high: corr 9 + ts_rank 14; close/low: delta 1.
+    return out.where(observed_over((volume, 36), (high, 22), (close, 2), (low, 2)))

@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #38 - 夏普比信号
+# 简要说明: ((-1*RANK(TSRANK(CLOSE,10)))*RANK(CLOSE/OPEN))，10日排名与日内涨跌幅的组合。
+# 典型用途: 中期排名与短期表现的交叉验证信号。
+# ============================================================
 """GTJA Alpha #38.
 
 Formula: (((SUM(HIGH,20)/20)<HIGH)?(-1*DELTA(HIGH,2)):0)
@@ -43,4 +49,8 @@ def compute(panel: dict) -> pd.DataFrame:
     h = panel["high"]
     m20 = ts_mean(h, 20)
     cond = m20 < h
-    return (-1.0 * delta(h, 2)).where(cond, 0.0)
+    out = (-1.0 * delta(h, 2)).where(cond, 0.0)
+    # A NaN comparison is False, not NaN, so cond is False (never NaN) for
+    # every bar in m20's warmup or a gap's 20-day window, and out falls
+    # through to the finite 0.0 branch instead of NaN.
+    return out.where(m20.notna())

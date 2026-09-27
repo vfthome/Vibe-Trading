@@ -9,6 +9,9 @@ Validates:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -19,6 +22,7 @@ from backtest.validation import (
     monte_carlo_test,
     run_validation,
     walk_forward_analysis,
+    write_validation_json,
 )
 
 
@@ -96,11 +100,42 @@ class TestMonteCarlo:
         result = monte_carlo_test(trades, 1_000_000)
         assert "error" in result
 
+    @pytest.mark.parametrize("n_simulations", [0, -1, -100, 1.5, "10", True])
+    def test_invalid_simulations_errors(self, n_simulations: object) -> None:
+        """A non-positive n_simulations must not raise (was ZeroDivisionError)."""
+        trades = _make_trades([100, -50, 200, -30, 150])
+        result = monte_carlo_test(trades, 1_000_000, n_simulations=n_simulations)
+        assert "error" in result
+        assert result["p_value_sharpe"] == 1.0
+
+    @pytest.mark.parametrize("seed", [-1, 1.5, "42", True])
+    def test_invalid_seed_errors(self, seed: object) -> None:
+        """An invalid seed must not escape as an opaque numpy error."""
+        trades = _make_trades([100, -50, 200, -30, 150])
+        result = monte_carlo_test(trades, 1_000_000, n_simulations=10, seed=seed)
+        assert "error" in result
+
     def test_reproducibility(self) -> None:
         trades = _make_trades([100, -50, 200, -30, 150, -80])
         r1 = monte_carlo_test(trades, 1_000_000, n_simulations=100, seed=42)
         r2 = monte_carlo_test(trades, 1_000_000, n_simulations=100, seed=42)
         assert r1["p_value_sharpe"] == r2["p_value_sharpe"]
+
+    def test_actual_sharpe_respects_bars_per_year(self) -> None:
+        # actual_sharpe must annualise with the caller's bars_per_year, not a
+        # hardcoded 252 -- otherwise it silently disagrees with
+        # bootstrap_sharpe_ci's Sharpe on a crypto (365) or forex (260) run
+        # in the same validation report.
+        trades = _make_trades([100, -50, 200, -30, 150, -80, 120, -40, 90, -20])
+        default = monte_carlo_test(trades, 1_000_000, n_simulations=50, seed=1)
+        crypto = monte_carlo_test(
+            trades, 1_000_000, n_simulations=50, seed=1, bars_per_year=365
+        )
+        assert default["actual_sharpe"] != crypto["actual_sharpe"]
+        expected_ratio = (365 / 252) ** 0.5
+        assert crypto["actual_sharpe"] == pytest.approx(
+            default["actual_sharpe"] * expected_ratio, abs=1e-3
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +170,27 @@ class TestBootstrapSharpe:
     def test_too_few_observations(self) -> None:
         eq = pd.Series([100, 101, 102], index=pd.bdate_range("2025-01-01", periods=3))
         result = bootstrap_sharpe_ci(eq, n_bootstrap=100)
+        assert "error" in result
+
+    @pytest.mark.parametrize("n_bootstrap", [0, -1, -50, 1.5, "10", True])
+    def test_invalid_bootstrap_errors(self, n_bootstrap: object) -> None:
+        """A non-positive n_bootstrap must not raise (was IndexError from percentile)."""
+        eq = _make_equity(100)
+        result = bootstrap_sharpe_ci(eq, n_bootstrap=n_bootstrap)
+        assert "error" in result
+
+    @pytest.mark.parametrize("confidence", [0.0, 1.0, 1.5, -0.2, float("inf"), float("nan"), "0.95", True])
+    def test_invalid_confidence_errors(self, confidence: object) -> None:
+        """A confidence outside (0, 1) must not raise (was percentile ValueError)."""
+        eq = _make_equity(100)
+        result = bootstrap_sharpe_ci(eq, confidence=confidence, n_bootstrap=100)
+        assert "error" in result
+
+    @pytest.mark.parametrize("seed", [-1, 1.5, "42", True])
+    def test_invalid_seed_errors(self, seed: object) -> None:
+        """An invalid seed must not escape as an opaque numpy error."""
+        eq = _make_equity(100)
+        result = bootstrap_sharpe_ci(eq, n_bootstrap=10, seed=seed)
         assert "error" in result
 
     def test_reproducibility(self) -> None:
@@ -204,6 +260,18 @@ class TestWalkForward:
         result = walk_forward_analysis(eq, [], n_windows=5)
         assert "error" in result
 
+    @pytest.mark.parametrize("n_windows", [0, -1, -3, 1.5, "5", True])
+    def test_invalid_windows_errors(self, n_windows: object) -> None:
+        """A non-positive n_windows must not raise or silently return garbage.
+
+        n_windows=0 raised ZeroDivisionError; a negative value silently returned
+        an empty ``windows`` list with a NaN ``return_mean`` and a negative
+        ``consistency_rate``.
+        """
+        eq = _make_equity(100)
+        result = walk_forward_analysis(eq, [], n_windows=n_windows)
+        assert "error" in result
+
 
 # ---------------------------------------------------------------------------
 # run_validation dispatcher
@@ -238,3 +306,179 @@ class TestRunValidation:
         result = run_validation(config, eq, trades, 1_000_000)
         assert "bootstrap" in result
         assert "monte_carlo" not in result
+
+    def test_monte_carlo_respects_run_validations_bars_per_year(self) -> None:
+        # run_validation resolves bars_per_year once and threads it into
+        # bootstrap/walk_forward already; monte_carlo must receive the same
+        # value instead of silently annualising at a hardcoded 252.
+        eq = _make_equity(100)
+        trades = _make_trades([100, -50, 200, -30, 150, -80, 120, -40, 90, -20])
+        config = {"validation": {"monte_carlo": {"n_simulations": 50, "seed": 1}}}
+        default = run_validation(config, eq, trades, 1_000_000, bars_per_year=252)
+        crypto = run_validation(config, eq, trades, 1_000_000, bars_per_year=365)
+        expected_ratio = (365 / 252) ** 0.5
+        assert crypto["monte_carlo"]["actual_sharpe"] == pytest.approx(
+            default["monte_carlo"]["actual_sharpe"] * expected_ratio, abs=1e-3
+        )
+
+    @pytest.mark.parametrize(
+        ("section", "field", "value"),
+        [
+            ("monte_carlo", "n_simulations", "10"),
+            ("monte_carlo", "seed", 1.5),
+            ("bootstrap", "n_bootstrap", True),
+            ("bootstrap", "confidence", float("inf")),
+            ("walk_forward", "n_windows", "5"),
+        ],
+    )
+    def test_malformed_nested_config_returns_error(
+        self, section: str, field: str, value: object
+    ) -> None:
+        """Raw nested config values fail visibly instead of raising."""
+        result = run_validation(
+            {"validation": {section: {field: value}}},
+            _make_equity(100),
+            _make_trades([100, -50, 200]),
+            1_000_000,
+        )
+        assert "error" in result[section]
+
+
+# ---------------------------------------------------------------------------
+# Strict validation.json writer
+# ---------------------------------------------------------------------------
+
+
+def _strict_json_load(text: str):
+    """Parse ``text`` rejecting non-RFC-8259 NaN/Infinity tokens."""
+
+    def _reject(value: str):
+        raise ValueError(f"non-strict JSON constant: {value}")
+
+    return json.loads(text, parse_constant=_reject)
+
+
+class TestWriteValidationJson:
+    def test_non_finite_metric_written_as_null(self, tmp_path: Path) -> None:
+        """A non-finite metric must be serialized as null, not a bare
+        NaN/Infinity token that strict JSON parsers reject."""
+        out = tmp_path / "artifacts" / "validation.json"
+        results = {
+            "monte_carlo": {
+                "actual_sharpe": float("inf"),
+                "p_value_sharpe": float("nan"),
+                "n_trades": 3,
+            }
+        }
+        written = write_validation_json(out, results)
+
+        text = out.read_text(encoding="utf-8")
+        assert "NaN" not in text
+        assert "Infinity" not in text
+        parsed = _strict_json_load(text)  # must not raise
+        assert parsed["monte_carlo"]["actual_sharpe"] is None
+        assert parsed["monte_carlo"]["p_value_sharpe"] is None
+        assert parsed["monte_carlo"]["n_trades"] == 3
+        assert written["monte_carlo"]["actual_sharpe"] is None
+
+    def test_creates_parent_dir(self, tmp_path: Path) -> None:
+        out = tmp_path / "does" / "not" / "exist" / "validation.json"
+        write_validation_json(out, {"ok": 1.0})
+        assert out.is_file()
+        assert _strict_json_load(out.read_text(encoding="utf-8")) == {"ok": 1.0}
+
+    def test_numpy_scalars_from_public_validators_are_strict_json(
+        self, tmp_path: Path
+    ) -> None:
+        results = {
+            "monte_carlo": monte_carlo_test(
+                _make_trades([100, -50, 200]),
+                1_000_000,
+                n_simulations=np.int64(2),
+                seed=np.int64(1),
+            ),
+            "bootstrap": bootstrap_sharpe_ci(
+                _make_equity(20),
+                n_bootstrap=np.int64(2),
+                seed=np.int64(1),
+            ),
+            "walk_forward": walk_forward_analysis(
+                _make_equity(20),
+                [],
+                n_windows=np.int64(2),
+            ),
+            "array": np.array([1, np.nan]),
+        }
+        out = tmp_path / "validation.json"
+
+        written = write_validation_json(out, results)
+
+        parsed = _strict_json_load(out.read_text(encoding="utf-8"))
+        assert parsed["monte_carlo"]["n_simulations"] == 2
+        assert parsed["bootstrap"]["n_bootstrap"] == 2
+        assert parsed["walk_forward"]["n_windows"] == 2
+        assert parsed["array"] == [1.0, None]
+        assert written == parsed
+
+
+def test_load_trades_blank_holding_days_defaults_to_zero(tmp_path: Path) -> None:
+    """Blank holding_days cells must not abort validation with ValueError."""
+    from backtest.validation import _load_trades
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "trades.csv").write_text(
+        "timestamp,code,side,price,qty,reason,pnl,holding_days,return_pct\n"
+        "2024-01-02,AAPL.US,sell,100,1,signal,10,,0.1\n",
+        encoding="utf-8",
+    )
+    trades = _load_trades(tmp_path)
+    assert len(trades) == 1
+    assert trades[0].holding_bars == 0
+    assert trades[0].pnl == 10.0
+
+
+def test_load_trades_prefers_fill_derived_holding_bars(tmp_path: Path) -> None:
+    from backtest.validation import _load_trades
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "trades.csv").write_text(
+        "timestamp,code,side,price,qty,reason,pnl,holding_days,holding_bars,return_pct\n"
+        "2026-01-05,A,sell,100,3,target_rebalance,1,3,1.5,0.1\n",
+        encoding="utf-8",
+    )
+
+    trades = _load_trades(tmp_path)
+
+    assert trades[0].holding_bars == pytest.approx(1.5)
+
+
+class TestBarsPerYearNone:
+    """Cross-market convention (runner passes bars_per_year=None, #1237)."""
+
+    def test_run_validation_with_none_does_not_crash(self) -> None:
+        eq = _make_equity(100)
+        trades = _make_trades([100, -50, 200, -30, 150])
+        config = {
+            "validation": {
+                "monte_carlo": {"n_simulations": 20},
+                "bootstrap": {"n_bootstrap": 20},
+                "walk_forward": {"n_windows": 3},
+            }
+        }
+        result = run_validation(config, eq, trades, 1_000_000, bars_per_year=None)
+        assert "bootstrap" in result and "walk_forward" in result
+        # _sharpe's np.sqrt(bars_per_year) must have been fed an int, not None.
+        assert result["bootstrap"]["observed_sharpe"] is not None
+        assert result["walk_forward"]["sharpe_std"] is not None
+
+    def test_run_validation_with_none_degrades_empty_equity(self) -> None:
+        result = run_validation(
+            {"validation": {"bootstrap": {"n_bootstrap": 10}}},
+            _make_equity(1),
+            [],
+            1_000_000,
+            bars_per_year=None,
+        )
+        assert "bootstrap" in result

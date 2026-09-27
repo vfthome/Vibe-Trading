@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #43 - 收益递归平均
+# 简要说明: SUM((CLOSE>DELAY(CLOSE,1)?VOLUME:0),26)/SUM((CLOSE<=DELAY(CLOSE,1)?VOLUME:0),26)*100，类似Alpha#40的变种。
+# 典型用途: 上涨量与下跌量的比值，用于评估市场参与者的方向偏好。
+# ============================================================
 """GTJA Alpha #43.
 
 Formula: SUM((CLOSE>DELAY(CLOSE,1)?VOLUME:(CLOSE<DELAY(CLOSE,1)?-VOLUME:0)),6)
@@ -44,4 +50,6 @@ def compute(panel: dict) -> pd.DataFrame:
     v = panel["volume"]
     pc = c.shift(1)
     signed = v.where(c > pc, -v.where(c < pc, 0.0))
+    # A missing close, prior close or volume is not a flat day (#1463).
+    signed = signed.where(c.notna() & pc.notna() & v.notna())
     return signed.rolling(6, min_periods=6).sum()

@@ -16,7 +16,7 @@ class BaseOptimizer(ABC):
 
     Subclasses implement ``_calc_weights``; the base handles:
     - active asset selection
-    - rolling window slicing and sanity checks
+    - causal rolling window slicing and sanity checks
     - covariance matrix + NaN checks
     - applying weights while preserving signal sign
 
@@ -42,7 +42,9 @@ class BaseOptimizer(ABC):
         """Apply optimizer to position weights.
 
         Args:
-            ret: Return matrix (dates x codes).
+            ret: Return matrix (dates x codes). For a decision at ``dt``,
+                only rows strictly earlier than ``dt`` are visible to the
+                optimizer because execution occurs at the decision bar's open.
             pos: Raw signal positions.
             dates: Date index aligned with ``pos``.
 
@@ -59,11 +61,27 @@ class BaseOptimizer(ABC):
             if not active or i < self.lookback:
                 continue
 
-            window = ret.loc[:dt, active].tail(self.lookback)
+            # Signals are executed at the decision bar's open.  ``ret[dt]``
+            # is a close-to-close return that is not observable until that
+            # bar closes, so including it here would leak future information
+            # into the weights applied at the open.
+            history = ret.loc[ret.index < dt, active]
+            window = history.tail(self.lookback)
             if len(window) < max(self.lookback // 2, 5):
                 continue
 
-            ctx = self._build_context(window, active)
+            signs = np.array([np.sign(pos.at[dt, c]) for c in active])
+            # Hand subclasses the window in POSITION space: a short's column is
+            # negated, so every context built from it describes what is actually
+            # being sized. ``mu`` becomes the position's expected return (a
+            # short earns the negative of its asset's drift) and ``cov`` becomes
+            # D Sigma D, whose cross terms flip sign for a long/short pair --
+            # signing only ``mu`` would score the numerator in position space
+            # and the variance in asset space, so a hedged pair would still
+            # read as correlated. Volatility-only contexts are unaffected
+            # (std(-r) == std(r)).
+            signed = window.mul(pd.Series(signs, index=window.columns), axis=1)
+            ctx = self._build_context(signed, active)
             if ctx is None:
                 continue
 
@@ -72,8 +90,7 @@ class BaseOptimizer(ABC):
                 continue
 
             for j, c in enumerate(active):
-                sign = np.sign(pos.at[dt, c])
-                result.at[dt, c] = sign * weights[j]
+                result.at[dt, c] = signs[j] * weights[j]
 
         return result
 
@@ -90,7 +107,10 @@ class BaseOptimizer(ABC):
         Return None to skip the date.
 
         Args:
-            window: Return window for active assets.
+            window: Return window for active assets, in POSITION space -- a
+                short's column is already negated by ``optimize``, so a mean
+                taken here is the position's expected return and a covariance
+                is the position covariance.
             active: Active asset codes.
 
         Returns:

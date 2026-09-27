@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #96
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第96号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #96.
 
 Formula (paper appendix): max(Ts_Rank(decay_linear(correlation(rank(vwap), rank(volume), 4), 4), 8), Ts_Rank(decay_linear(Ts_ArgMax(correlation(Ts_Rank(close,7), Ts_Rank(adv60,4), 4), 13), 14), 13)) * -1
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['close', 'volume', 'vwap'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 103,
@@ -58,4 +65,9 @@ def compute(panel: dict) -> pd.DataFrame:
     arr_a = a.to_numpy(dtype=np.float64, na_value=np.nan)
     arr_b = b.to_numpy(dtype=np.float64, na_value=np.nan)
     out = pd.DataFrame(np.fmax(arr_a, arr_b), index=close.index, columns=close.columns) * -1.0
-    return out
+    # np.fmax returns the other side when one is missing; mask where a gap sits
+    # inside an input's reach (#1463). A side that is undefined on complete data (a
+    # constant window's correlation) keeps the other side, as before (#1452).
+    # volume: adv60 + ts_rank 4 + corr 4 + argmax 13 + decay 14 + ts_rank 13; close: ts_rank 7
+    # + the same; vwap: corr 4 + decay 4 + ts_rank 8.
+    return out.where(observed_over((volume, 103), (close, 47), (vwap, 14)))

@@ -9,11 +9,20 @@ Excel (.xlsx/.xls) always opens as utf-8 internally via openpyxl/xlrd.
 
 from __future__ import annotations
 
+import re
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+# Broker CSV/Excel cells often include ISO codes or currency glyphs around the
+# number (Schwab/IBKR "$1,234.56", JP/CN "¥1000"). Commas are already stripped;
+# without stripping these tokens float() fails and we silently store 0.0.
+_CURRENCY_TOKEN_RE = re.compile(
+    r"(?i)(?<![A-Za-z])(?:USDT|USDC|USD|EUR|GBP|JPY|CNY|HKD)(?![A-Za-z])|[$€£¥￥]"
+)
 
 FormatName = str  # "tonghuashun" | "eastmoney" | "futu" | "generic" | "unknown"
 
@@ -24,8 +33,66 @@ _A_SHARE_EXCHANGE_MAP = {
     ("4", "8"): ".BJ",
 }
 
-_BUY_TOKENS = {"buy", "b", "买入", "证券买入", "融资买入", "做多", "long"}
-_SELL_TOKENS = {"sell", "s", "卖出", "证券卖出", "融券卖出", "做空", "short"}
+_BUY_TOKENS = {
+    "buy",
+    "b",
+    "purchase",
+    "buy to cover",
+    "buy-to-cover",
+    "buy_to_cover",
+    "买入",
+    "证券买入",
+    "融资买入",
+    "做多",
+    "long",
+}
+_SELL_TOKENS = {
+    "sell",
+    "s",
+    "sell short",
+    "sell-short",
+    "sell_short",
+    "卖出",
+    "证券卖出",
+    "融券卖出",
+    "做空",
+    "short",
+}
+# Cash dividend events (同花顺 红利入账, 富途 Side=Dividend, ...). They bring
+# cash into the account without moving shares, so they parse as
+# side="dividend" records whose `amount` carries the cash received.
+_DIVIDEND_TOKENS = {
+    "dividend",
+    "cash dividend",
+    "红利入账",
+    "红利",
+    "分红",
+    "分红入账",
+    "派息",
+    "股息入账",
+    "股息",
+    "现金分红",
+}
+# Non-trade corporate-action rows are dropped outright instead of parsed:
+# bonus-share / conversion credits and splits only move share counts (the
+# frame-caliber adjustment from #1311 already restates split effects on
+# covered symbols, and we do not model bonus shares), rights issues are a
+# separate subscription flow, and 利息 entries are interest settlements, not
+# trade PnL. The English tokens cover Futu/generic exports of the same events.
+_SKIP_SIDE_TOKENS = {
+    "红股入账",
+    "转股入账",
+    "配股缴款",
+    "配股上市",
+    "利息归本",
+    "利息",
+    "stock dividend",
+    "bonus issue",
+    "stock split",
+    "reverse split",
+    "rights issue",
+    "interest",
+}
 
 
 @dataclass(frozen=True)
@@ -36,7 +103,7 @@ class TradeRecord:
         datetime: ISO8601 timestamp, e.g. "2026-01-15 09:35:00".
         symbol: Exchange-qualified symbol, e.g. "600519.SH" / "AAPL" / "BTC-USDT".
         name: Human-readable instrument name.
-        side: "buy" or "sell".
+        side: "buy", "sell" or "dividend" (cash payout; amount is the cash).
         quantity: Filled quantity.
         price: Filled price.
         amount: Gross amount (quantity * price, pre-fee).
@@ -81,12 +148,13 @@ def load_dataframe(path: str | Path) -> pd.DataFrame:
         raise ValueError(f"Unsupported extension: {ext}")
 
     last_err: Exception | None = None
-    for enc in ("utf-8", "utf-8-sig", "gbk", "gb2312"):
+    # utf-16 covers Excel "CSV UTF-16" / Unicode exports (BOM required).
+    for enc in ("utf-8-sig", "utf-8", "utf-16", "gbk", "gb2312"):
         try:
             return pd.read_csv(p, dtype=str, encoding=enc)
         except UnicodeDecodeError as exc:
             last_err = exc
-    raise ValueError(f"Failed to decode CSV with utf-8/gbk/gb2312: {last_err}")
+    raise ValueError(f"Failed to decode CSV with utf-8/utf-16/gbk/gb2312: {last_err}")
 
 
 # ---------------- Format detection ----------------
@@ -122,16 +190,104 @@ def detect_format(df: pd.DataFrame) -> FormatName:
 # ---------------- Parsers ----------------
 
 def _normalize_side(raw: Any) -> str:
-    """Return 'buy'/'sell', falling back to 'buy'."""
+    """Return ``buy``/``sell``/``dividend`` for an exact supported direction alias.
+
+    Raises:
+        ValueError: Direction is missing or unsupported.
+    """
+    if raw is None or pd.isna(raw):
+        raise ValueError("Trade side is required")
     s = str(raw).strip().lower()
-    if s in _SELL_TOKENS or any(tok in s for tok in _SELL_TOKENS):
+    if not s:
+        raise ValueError("Trade side is required")
+    if s in _BUY_TOKENS:
+        return "buy"
+    if s in _SELL_TOKENS:
         return "sell"
-    return "buy"
+    if s in _DIVIDEND_TOKENS:
+        return "dividend"
+    raise ValueError(f"Unsupported trade side: {raw!r}")
+
+
+# A cash-dividend row carries no quantity and no price, so the usual
+# ``amount or qty * price`` fallback collapses to 0.0 when the export names the
+# cash column differently from a fill's. Brokers do exactly that: 同花顺 and
+# 东财 book the payout under a cash-movement heading (发生金额 / 资金发生额 /
+# 红利金额 / 实发金额) rather than under 成交金额, and Futu uses a net-amount
+# column. Reading only the fill column would book the dividend as 0 SILENTLY —
+# the "successful run recorded as zero" shape this parser exists to avoid — so
+# a dividend row tries the cash headings too, and anything still zero is
+# surfaced by ``_compute_profile`` rather than averaged in as a real zero.
+_DIVIDEND_AMOUNT_KEYS: tuple[str, ...] = (
+    "成交金额",
+    "发生金额",
+    "资金发生额",
+    "红利金额",
+    "实发金额",
+    "税后金额",
+    "Amount",
+    "Net Amount",
+    "NetAmount",
+)
+
+
+def _dividend_amount(row: Any, primary: float) -> float:
+    """Return a dividend row's cash, trying the cash-movement headings.
+
+    Args:
+        row: One export row (mapping-like, from ``DataFrame.iterrows``).
+        primary: Amount already derived from the fill columns.
+
+    Returns:
+        The first non-zero candidate, else ``0.0`` (surfaced downstream, never
+        silently treated as a real zero payout).
+    """
+    if primary:
+        return primary
+    for key in _DIVIDEND_AMOUNT_KEYS:
+        value = _to_float(row.get(key))
+        if value:
+            return value
+    return 0.0
+
+
+def _is_skippable_side(raw: Any) -> bool:
+    """True for known non-trade corporate-action rows; callers drop the row."""
+    if raw is None:
+        return False
+    try:
+        if pd.isna(raw):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(raw).strip().lower() in _SKIP_SIDE_TOKENS
+
+
+def _is_empty_code(raw: Any) -> bool:
+    """True for None/NaN/blank securities codes from CSV/Excel cells."""
+    if raw is None:
+        return True
+    try:
+        if pd.isna(raw):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return not str(raw).strip()
 
 
 def _qualify_a_share(code: str) -> str:
     """Append .SH/.SZ/.BJ suffix to a bare A-share ticker."""
-    code = str(code).strip().zfill(6)
+    if _is_empty_code(code):
+        raise ValueError("empty securities code")
+    code = str(code).strip()
+    # Excel/CSV numeric cells stringify as "600519.0"/sci — not exchange suffixes.
+    try:
+        as_float = float(code)
+        if as_float.is_integer() and abs(as_float) < 10_000_000:
+            code = str(int(as_float))
+    except (ValueError, OverflowError):
+        pass
+    code = code.zfill(6)
     if "." in code:
         return code.upper()
     first = code[0]
@@ -146,8 +302,12 @@ def _to_float(val: Any, default: float = 0.0) -> float:
     if val is None:
         return default
     try:
-        s = str(val).replace(",", "").strip()
-        return float(s) if s else default
+        s = str(val).strip().replace("\u2212", "-")
+        s = _CURRENCY_TOKEN_RE.sub("", s).replace(",", "").strip()
+        if not s:
+            return default
+        parsed = float(s)
+        return parsed if math.isfinite(parsed) else default
     except (ValueError, TypeError):
         return default
 
@@ -160,15 +320,23 @@ def parse_tonghuashun(df: pd.DataFrame) -> list[TradeRecord]:
     """
     records: list[TradeRecord] = []
     for _, row in df.iterrows():
+        raw_code = row.get("证券代码", "")
+        if _is_empty_code(raw_code):
+            continue
+        if _is_skippable_side(row.get("操作")):
+            continue
         qty = _to_float(row.get("成交数量"))
         price = _to_float(row.get("成交价格"))
         amount = _to_float(row.get("成交金额")) or qty * price
+        side = _normalize_side(row.get("操作"))
+        if side == "dividend":
+            amount = _dividend_amount(row, amount)
         fee = _to_float(row.get("手续费")) + _to_float(row.get("印花税")) + _to_float(row.get("过户费"))
         records.append(TradeRecord(
-            datetime=str(row.get("成交时间", "")).strip(),
-            symbol=_qualify_a_share(row.get("证券代码", "")),
+            datetime=_ths_datetime(row.get("成交时间", "")),
+            symbol=_qualify_a_share(raw_code),
             name=str(row.get("证券名称", "")).strip(),
-            side=_normalize_side(row.get("操作")),
+            side=side,
             quantity=qty,
             price=price,
             amount=amount,
@@ -176,6 +344,34 @@ def parse_tonghuashun(df: pd.DataFrame) -> list[TradeRecord]:
             market="china_a",
         ))
     return records
+
+
+def _ths_datetime(val: Any) -> str:
+    """Normalize 成交时间; Excel serial floats become ISO datetime."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    # iterrows yields numpy integer/float scalars; bare pd.to_datetime(int) is ns-epoch.
+    if pd.api.types.is_number(val) and not isinstance(val, (bool,)):
+        ts = pd.to_datetime(float(val), unit="D", origin="1899-12-30", errors="coerce")
+        if pd.notna(ts):
+            return ts.strftime("%Y-%m-%d %H:%M:%S")
+    # load_dataframe uses dtype=str; Excel serials arrive as "44927" / "44927.5".
+    text = str(val).strip()
+    if text and not any(ch in text for ch in "/-:"):
+        try:
+            serial = float(text)
+        except ValueError:
+            serial = None
+        else:
+            # Civil day serials; YYYYMMDD ints are >= 19_000_001.
+            if 1.0 <= serial < 100_000.0:
+                ts = pd.to_datetime(serial, unit="D", origin="1899-12-30", errors="coerce")
+                if pd.notna(ts):
+                    return ts.strftime("%Y-%m-%d %H:%M:%S")
+    ts = pd.to_datetime(val, errors="coerce")
+    if pd.notna(ts):
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
+    return text
 
 
 def parse_eastmoney(df: pd.DataFrame) -> list[TradeRecord]:
@@ -186,7 +382,24 @@ def parse_eastmoney(df: pd.DataFrame) -> list[TradeRecord]:
     """
     records: list[TradeRecord] = []
     for _, row in df.iterrows():
+        raw_code = row.get("股票代码", "")
+        if _is_empty_code(raw_code):
+            continue
+        if _is_skippable_side(row.get("买卖标志")):
+            continue
         raw_date = str(row.get("成交日期", "")).strip()
+        # Excel numeric YYYYMMDD cells stringify as "20260115.0".
+        # Day-count serials (dtype=str load) arrive as "44941" / "44941.0".
+        try:
+            as_float = float(raw_date)
+            if as_float.is_integer() and 19_000_001 <= int(as_float) <= 21_001_231:
+                raw_date = f"{int(as_float):08d}"
+            elif 1.0 <= as_float < 100_000.0:
+                ts = pd.to_datetime(as_float, unit="D", origin="1899-12-30", errors="coerce")
+                if pd.notna(ts):
+                    raw_date = ts.strftime("%Y-%m-%d")
+        except (ValueError, OverflowError):
+            pass
         raw_time = str(row.get("成交时间", "")).strip()
         if len(raw_date) == 8 and raw_date.isdigit():
             iso_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
@@ -196,12 +409,15 @@ def parse_eastmoney(df: pd.DataFrame) -> list[TradeRecord]:
         qty = _to_float(row.get("成交数量"))
         price = _to_float(row.get("成交均价"))
         amount = _to_float(row.get("成交金额")) or qty * price
+        side = _normalize_side(row.get("买卖标志"))
+        if side == "dividend":
+            amount = _dividend_amount(row, amount)
         fee = _to_float(row.get("佣金")) + _to_float(row.get("印花税"))
         records.append(TradeRecord(
             datetime=dt,
-            symbol=_qualify_a_share(row.get("股票代码", "")),
+            symbol=_qualify_a_share(raw_code),
             name=str(row.get("股票名称", "")).strip(),
-            side=_normalize_side(row.get("买卖标志")),
+            side=side,
             quantity=qty,
             price=price,
             amount=amount,
@@ -223,6 +439,67 @@ def _futu_market(symbol: str, market_hint: str) -> str:
     return "other"
 
 
+def _futu_datetime(date_val: Any, time_val: Any) -> str:
+    """Combine Futu Date+Time cells; Excel serial floats become ISO datetime."""
+    # iterrows yields numpy integer/float scalars; bare pd.to_datetime(int) is ns-epoch.
+    if pd.api.types.is_number(date_val) and not isinstance(date_val, (bool,)):
+        if not (isinstance(date_val, float) and pd.isna(date_val)):
+            serial = float(date_val)
+            frac = 0.0
+            time_is_frac = False
+            if pd.api.types.is_number(time_val) and not isinstance(time_val, (bool,)):
+                if not (isinstance(time_val, float) and pd.isna(time_val)):
+                    candidate = float(time_val)
+                    if 0.0 <= candidate < 1.0:
+                        frac = candidate
+                        time_is_frac = True
+            ts = pd.to_datetime(serial + frac, unit="D", origin="1899-12-30", errors="coerce")
+            if pd.notna(ts):
+                if time_is_frac or time_val is None or (
+                    isinstance(time_val, float) and pd.isna(time_val)
+                ):
+                    return ts.strftime("%Y-%m-%d %H:%M:%S")
+                # Numeric Excel date + string/clock Time column.
+                return f"{ts.strftime('%Y-%m-%d')} {str(time_val).strip()}".strip()
+    # load_dataframe uses dtype=str; Excel serial dates arrive as "45321" / "45321.0".
+    date_text = (
+        ""
+        if date_val is None or (isinstance(date_val, float) and pd.isna(date_val))
+        else str(date_val).strip()
+    )
+    if date_text and not any(ch in date_text for ch in "/-:"):
+        try:
+            serial = float(date_text)
+        except ValueError:
+            serial = None
+        else:
+            if 1.0 <= serial < 100_000.0:
+                frac = 0.0
+                time_is_frac = False
+                time_text = (
+                    ""
+                    if time_val is None or (isinstance(time_val, float) and pd.isna(time_val))
+                    else str(time_val).strip()
+                )
+                if time_text and not any(ch in time_text for ch in "/-:"):
+                    try:
+                        candidate = float(time_text)
+                    except ValueError:
+                        candidate = None
+                    else:
+                        if 0.0 <= candidate < 1.0:
+                            frac = candidate
+                            time_is_frac = True
+                ts = pd.to_datetime(serial + frac, unit="D", origin="1899-12-30", errors="coerce")
+                if pd.notna(ts):
+                    if time_is_frac or not time_text:
+                        return ts.strftime("%Y-%m-%d %H:%M:%S")
+                    return f"{ts.strftime('%Y-%m-%d')} {time_text}".strip()
+    date = date_text
+    time = "" if time_val is None or (isinstance(time_val, float) and pd.isna(time_val)) else str(time_val).strip()
+    return f"{date} {time}".strip()
+
+
 def parse_futu(df: pd.DataFrame) -> list[TradeRecord]:
     """Parse 富途 exports (English headers, HK+US mix).
 
@@ -231,19 +508,26 @@ def parse_futu(df: pd.DataFrame) -> list[TradeRecord]:
     """
     records: list[TradeRecord] = []
     for _, row in df.iterrows():
-        date = str(row.get("Date", "")).strip()
-        time = str(row.get("Time", "")).strip()
-        dt = f"{date} {time}".strip()
-        symbol = str(row.get("Symbol", "")).strip().upper()
+        raw_symbol = row.get("Symbol", "")
+        if _is_empty_code(raw_symbol):
+            continue
+        side_raw = row.get("Side") if "Side" in df.columns else row.get("Direction")
+        if _is_skippable_side(side_raw):
+            continue
+        dt = _futu_datetime(row.get("Date", ""), row.get("Time", ""))
+        symbol = str(raw_symbol).strip().upper()
         qty = _to_float(row.get("Quantity"))
         price = _to_float(row.get("Price"))
         amount = _to_float(row.get("Amount")) or qty * price
+        futu_side = _normalize_side(side_raw)
+        if futu_side == "dividend":
+            amount = _dividend_amount(row, amount)
         fee = _to_float(row.get("Commission")) + _to_float(row.get("Platform Fee"))
         records.append(TradeRecord(
             datetime=dt,
             symbol=symbol,
             name=str(row.get("Name", "")).strip(),
-            side=_normalize_side(row.get("Side") if "Side" in df.columns else row.get("Direction")),
+            side=futu_side,
             quantity=qty,
             price=price,
             amount=amount,
@@ -281,12 +565,23 @@ def parse_generic(df: pd.DataFrame) -> list[TradeRecord]:
     amount_col = pick("amount", "value", "notional")
     fee_col = pick("fee", "commission", "fees")
 
+    if side_col is None:
+        raise ValueError(
+            "Generic trade journal requires a side, direction, or action column"
+        )
+
     records: list[TradeRecord] = []
     for _, row in df.iterrows():
+        if sym_col and _is_empty_code(row.get(sym_col)):
+            continue
+        if _is_skippable_side(row.get(side_col)):
+            continue
         if dt_col:
-            dt = str(row.get(dt_col, "")).strip()
+            raw_dt = row.get(dt_col, "")
+            dt = _generic_datetime_cell(raw_dt)
         elif date_col:
-            dt = str(row.get(date_col, "")).strip()
+            raw_dt = row.get(date_col, "")
+            dt = _generic_datetime_cell(raw_dt)
         else:
             dt = ""
         symbol = str(row.get(sym_col, "")).strip() if sym_col else ""
@@ -294,19 +589,50 @@ def parse_generic(df: pd.DataFrame) -> list[TradeRecord]:
         price = _to_float(row.get(price_col)) if price_col else 0.0
         amount = _to_float(row.get(amount_col)) if amount_col else qty * price
         fee = _to_float(row.get(fee_col)) if fee_col else 0.0
+        generic_side = _normalize_side(row.get(side_col))
+        generic_amount = amount or qty * price
+        if generic_side == "dividend":
+            generic_amount = _dividend_amount(row, generic_amount)
         market = _infer_market_from_symbol(symbol)
         records.append(TradeRecord(
             datetime=dt,
             symbol=symbol.upper(),
             name=str(row.get(name_col, "")).strip() if name_col else "",
-            side=_normalize_side(row.get(side_col) if side_col else "buy"),
+            side=generic_side,
             quantity=qty,
             price=price,
-            amount=amount or qty * price,
+            amount=generic_amount,
             fee=fee,
             market=market,
         ))
     return records
+
+
+def _generic_datetime_cell(val: Any) -> str:
+    """Normalize a generic datetime/date cell; Excel serials become ISO datetime."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    if pd.api.types.is_number(val) and not isinstance(val, (bool,)):
+        serial = float(val)
+        if 1.0 <= serial < 100_000.0:
+            ts = pd.to_datetime(serial, unit="D", origin="1899-12-30", errors="coerce")
+            if pd.notna(ts):
+                return ts.strftime("%Y-%m-%d %H:%M:%S")
+    text = str(val).strip()
+    if text and not any(ch in text for ch in "/-:"):
+        try:
+            serial = float(text)
+        except ValueError:
+            serial = None
+        else:
+            if 1.0 <= serial < 100_000.0:
+                ts = pd.to_datetime(serial, unit="D", origin="1899-12-30", errors="coerce")
+                if pd.notna(ts):
+                    return ts.strftime("%Y-%m-%d %H:%M:%S")
+    ts = pd.to_datetime(val, errors="coerce")
+    if pd.notna(ts):
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
+    return text
 
 
 def _infer_market_from_symbol(symbol: str) -> str:
@@ -314,10 +640,21 @@ def _infer_market_from_symbol(symbol: str) -> str:
     s = symbol.upper()
     if s.endswith(".HK"):
         return "hk"
+    if s.endswith(".L"):
+        # LSE names (#1206); without this they landed in "other"
+        # and shadow analysis silently degraded to NaN.
+        return "uk"
     if s.endswith(".SH") or s.endswith(".SZ") or s.endswith(".BJ"):
         return "china_a"
-    if "-" in s and any(quote in s for quote in ("USDT", "USDC", "BTC", "USD")):
+    if ("-" in s or "/" in s) and any(quote in s for quote in ("USDT", "USDC", "BTC", "USD")):
         return "crypto"
+    # Binance-style concatenated pairs (BTCUSDT) are purely alphabetic, so the
+    # isalpha() US-equity branch below would mis-label them without this check.
+    for quote in ("USDT", "USDC", "BUSD"):
+        if len(s) > len(quote) and s.endswith(quote):
+            base = s[: -len(quote)]
+            if base.isalpha() and len(base) >= 2:
+                return "crypto"
     if s.isalpha():
         return "us"
     return "other"

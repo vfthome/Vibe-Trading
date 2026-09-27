@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #23
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第23号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #23.
 
 Formula (paper appendix): ((sum(high,20)/20) < high) ? (-1*delta(high,2)) : 0
@@ -37,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['high', 'close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 20,
@@ -82,4 +88,9 @@ def compute(panel: dict) -> pd.DataFrame:
     where_ternary = _where_ternary
     mh = rolling_sum(high, 20) / 20.0
     out = where_ternary(mh < high, -1.0 * delta(high, 2), 0.0 * close)
-    return out
+    # A NaN comparison is False, not NaN, so where_ternary's own
+    # np.isfinite safety net never fires here: the else branch is 0.0
+    # times a finite close, so it stays finite well before mh's 20-day
+    # lookback is available, fabricating a signal during warmup instead
+    # of NaN.
+    return out.where(mh.notna())

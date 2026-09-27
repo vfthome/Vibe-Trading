@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #19 - 波动条件信号
+# 简要说明: (-1*SIGN(DELTA(CLOSE,7)) + SIGN(DELTA(CLOSE,7)) * RANK(TSMIN(LOW,12)))，7日价格方向与12日最低排名的组合。
+# 典型用途: 趋势方向与支撑位置的组合交易信号。
+# ============================================================
 """GTJA Alpha #19.
 
 Formula: (CLOSE<DELAY(CLOSE,5)?(CLOSE-DELAY(CLOSE,5))/DELAY(CLOSE,5):(CLOSE=DELAY(CLOSE,5)?0:(CLOSE-DELAY(CLOSE,5))/CLOSE))
@@ -48,4 +54,7 @@ def compute(panel: dict) -> pd.DataFrame:
     out = pd.DataFrame(np.where(dn, safe_div(diff, pc).to_numpy(),
                                 np.where(up, safe_div(diff, c).to_numpy(), 0.0)),
                        index=c.index, columns=c.columns)
-    return out
+    # NaN comparisons are False, not NaN, so a missing close or prior
+    # close (warmup, or a halt) reads exactly like a real tie and gets
+    # the fabricated 0.0 above instead of NaN.
+    return out.where(c.notna() & pc.notna())

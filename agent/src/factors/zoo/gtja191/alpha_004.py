@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA #4 - 条件止损信号
+# 简要说明: (-1 * Ts_Rank(rank(low), 9))，最低价9日时间序列排名取负。
+# 典型用途: 价格持续创近期新低时发出超卖信号。
+# ============================================================
 """GTJA Alpha #4.
 
 Formula: ((((SUM(CLOSE,8)/8)+STD(CLOSE,8))<(SUM(CLOSE,2)/2))?(-1):((SUM(CLOSE,2)/2<(SUM(CLOSE,8)/8-STD(CLOSE,8)))?1:((1<(VOLUME/MEAN(VOLUME,20)))?1:(-1))))
@@ -54,4 +60,10 @@ def compute(panel: dict) -> pd.DataFrame:
     res = np.where(cond_top, -1.0,
                    np.where(cond_bot, 1.0,
                             np.where(vol_strong, 1.0, -1.0)))
+    # NaN comparisons are False, not NaN, so a gap in any trailing window
+    # (a halt day inside the 8/20-day lookback, not just series warmup)
+    # would otherwise fall through to the innermost -1.0 branch instead of
+    # propagating NaN like every other operator in this zoo.
+    invalid = ma8.isna() | sd8.isna() | ma2.isna() | vmean20.isna()
+    res = np.where(invalid.to_numpy(), np.nan, res)
     return pd.DataFrame(res, index=c.index, columns=c.columns).astype(float)

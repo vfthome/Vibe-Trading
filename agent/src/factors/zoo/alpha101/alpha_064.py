@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #64
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第64号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #64.
 
 Formula (paper appendix): (rank(correlation(sum(0.178*open+0.822*low,13), sum(adv120,13), 17)) < rank(delta(0.178*((high+low)/2)+0.822*vwap, 4))) * -1
@@ -12,6 +18,7 @@ import pandas as pd
 from src.factors.base import (
     decay_linear,
     delta,
+    observed_over,
     rank,
     safe_div,
     scale,
@@ -37,7 +44,7 @@ __alpha_meta__ = {
     'columns_required': ['open', 'high', 'low', 'volume', 'vwap', 'close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 136,
@@ -66,4 +73,6 @@ def compute(panel: dict) -> pd.DataFrame:
     lhs = rank(ts_corr(rolling_sum(a, 13), rolling_sum(adv120, 13), 17))
     rhs = rank(delta(b, 4))
     out = (lhs < rhs).astype(float) * -1.0
-    return out
+    # Reach of each input through the nested windows; a gap inside it is not a verdict (#1463).
+    # volume: adv120 + sum 13 + corr 17; open/low: sum 13 + corr 17; high/vwap: delta 4.
+    return out.where(observed_over((volume, 148), (open_, 29), (low, 29), (high, 5), (vwap, 5)))

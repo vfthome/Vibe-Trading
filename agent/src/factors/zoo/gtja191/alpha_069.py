@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: GTJA Alpha #69
+# 简要说明: 国泰君安191短周期交易型alpha因子第69号，详见公式定义。
+# 典型用途: 在A股市场经中性化处理后用于选股或股指期货日内交易。
+# ============================================================
 """GTJA Alpha #69.
 
 Formula: (SUM(DTM,20)>SUM(DBM,20)?(SUM(DTM,20)-SUM(DBM,20))/SUM(DTM,20):(SUM(DTM,20)=SUM(DBM,20)?0:(SUM(DTM,20)-SUM(DBM,20))/SUM(DBM,20)))
@@ -55,4 +61,7 @@ def compute(panel: dict) -> pd.DataFrame:
     res = pd.DataFrame(np.where(sd > sb, (safe_div(sd - sb, sd)).to_numpy(),
                                 np.where(sd < sb, (safe_div(sd - sb, sb)).to_numpy(), 0.0)),
                        index=o.index, columns=o.columns)
-    return res
+    # NaN comparisons are False, not NaN, so a gap in sd/sb's 20-day
+    # window (a halt inside the lookback, not just series warmup) would
+    # otherwise fall through to the tie branch's hard-coded 0.0.
+    return res.where(sd.notna() & sb.notna())

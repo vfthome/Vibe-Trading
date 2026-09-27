@@ -15,6 +15,8 @@ from typing import List, Optional
 from rich.console import Console
 from rich.table import Table
 
+from src.config.accessor import get_env_config, reset_env_config
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -29,11 +31,17 @@ class CheckResult:
 
 def _check_llm_provider() -> CheckResult:
     """Verify LLM provider connectivity."""
-    from src.providers.llm import _ensure_dotenv, _sync_provider_env
+    from src.providers.llm import _ensure_dotenv, _sync_provider_env, provider_diagnostics
 
     _ensure_dotenv()
-    provider = os.getenv("LANGCHAIN_PROVIDER", "").strip()
-    model = os.getenv("LANGCHAIN_MODEL_NAME", "").strip()
+    # The EnvConfig singleton may have been cached before _ensure_dotenv()
+    # loaded the .env file (e.g. by theme.py's import-time _is_dark_terminal
+    # call). Reset it so get_env_config() rebuilds from the now-populated
+    # os.environ.
+    reset_env_config()
+    _cfg = get_env_config()
+    provider = _cfg.llm.langchain_provider.strip()
+    model = _cfg.llm.langchain_model_name.strip()
 
     if not provider:
         return CheckResult(
@@ -53,7 +61,15 @@ def _check_llm_provider() -> CheckResult:
         )
 
     _sync_provider_env()
-    base_url = os.getenv("OPENAI_BASE_URL", "") or os.getenv("OPENAI_API_BASE", "")
+    diagnostics = provider_diagnostics()
+    base_url = os.getenv("OPENAI_BASE_URL", "") or os.getenv("OPENAI_API_BASE", "")  # noqa: env-gate — diagnostic base URL fallback
+    proxy_label = ",".join(sorted(diagnostics.get("proxy", {}).keys())) or "none"
+    diag_hint = (
+        f"base={diagnostics['base_url']} "
+        f"timeout={diagnostics['timeout_seconds']}s "
+        f"retries={diagnostics['max_retries']} "
+        f"proxy={proxy_label}"
+    )
 
     if provider.lower() in {"openai-codex", "openai_codex"}:
         try:
@@ -80,7 +96,26 @@ def _check_llm_provider() -> CheckResult:
         return CheckResult(
             name=f"LLM ({provider})",
             status="ready",
-            message=f"{model} via ChatGPT OAuth ({account})",
+            message=f"{model} via ChatGPT OAuth ({account}) | {diag_hint}",
+            impact="",
+        )
+
+    if provider.lower() in {"copilot", "github-copilot"}:
+        from src.providers.copilot_auth import get_copilot_auth_status
+
+        authenticated, status_message = get_copilot_auth_status()
+        if not authenticated:
+            return CheckResult(
+                name=f"LLM ({provider})",
+                status="not_configured",
+                message=f"Copilot SDK: {status_message}",
+                impact="run `gh auth login`, `copilot`, or set COPILOT_GITHUB_TOKEN",
+                critical=True,
+            )
+        return CheckResult(
+            name=f"LLM ({provider})",
+            status="ready",
+            message=f"{model} via Copilot SDK ({status_message}) | {diag_hint}",
             impact="",
         )
 
@@ -88,7 +123,7 @@ def _check_llm_provider() -> CheckResult:
         return CheckResult(
             name=f"LLM ({provider})",
             status="not_configured",
-            message=f"base URL not set for {provider}",
+            message=f"base URL not set for {provider} | {diag_hint}",
             impact="agent cannot function",
             critical=True,
         )
@@ -101,18 +136,18 @@ def _check_llm_provider() -> CheckResult:
         ping_url = base_url.rstrip("/")
         if ping_url.endswith("/v1"):
             ping_url = ping_url[:-3]
-        resp = requests.get(ping_url, timeout=10)
+        requests.get(ping_url, timeout=10, allow_redirects=False)
         return CheckResult(
             name=f"LLM ({provider})",
             status="ready",
-            message=f"{model} via {base_url}",
+            message=f"{model} via {diagnostics['base_url']} | {diag_hint}",
             impact="",
         )
     except Exception as exc:
         return CheckResult(
             name=f"LLM ({provider})",
             status="error",
-            message=f"{type(exc).__name__}: {exc}",
+            message=f"{type(exc).__name__}: {exc} | {diag_hint}",
             impact="agent cannot function",
             critical=True,
         )
@@ -177,7 +212,7 @@ def _check_yfinance() -> CheckResult:
 
 def _check_tushare() -> CheckResult:
     """Check Tushare token configuration."""
-    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    token = get_env_config().data.tushare_token.strip()
     if not token or token == "your-tushare-token":
         return CheckResult(
             name="Tushare",
@@ -209,6 +244,17 @@ def _check_akshare() -> CheckResult:
             impact="A-share/forex fallback unavailable",
         )
     return CheckResult(name="akshare", status="ready", message="installed", impact="")
+
+
+def _check_content_filter_threshold() -> CheckResult:
+    """Report the configured content filter warning threshold."""
+    threshold = get_env_config().agent_tuning.content_filter_warning_threshold
+    return CheckResult(
+        name="Content Filter Threshold",
+        status="ready",
+        message=f"{threshold:.0%} (set via CONTENT_FILTER_WARNING_THRESHOLD)",
+        impact="",
+    )
 
 
 def _check_ccxt() -> CheckResult:
@@ -254,6 +300,7 @@ def run_preflight(console: Optional[Console] = None) -> List[CheckResult]:
         _check_tushare,
         _check_akshare,
         _check_ccxt,
+        _check_content_filter_threshold,
     ]
 
     results: List[CheckResult] = []

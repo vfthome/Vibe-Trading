@@ -1,3 +1,9 @@
+
+# ============================================================
+# 中文名称: Kakushadze Alpha #21
+# 简要说明: Kakushadze (2015) 101 Formulaic Alphas 中的第21号因子，详见公式定义。
+# 典型用途: 作为多因子模型中的alpha信号，经中性化处理后用于选股或股指期货交易。
+# ============================================================
 """Kakushadze Alpha #21.
 
 Formula (paper appendix): complex piecewise; see paper
@@ -37,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['close', 'volume'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 20,
@@ -95,4 +101,8 @@ def compute(panel: dict) -> pd.DataFrame:
     cond_c = (v_adv >= 1.0)
     one = make_one(close)
     out = where_ternary(cond_a, -1.0 * one, where_ternary(cond_b, one, where_ternary(cond_c, one, -1.0 * one)))
-    return out
+    # A NaN comparison is False, not NaN, so where_ternary's own
+    # np.isfinite safety net never fires here: every branch is a pure
+    # constant with no NaN dependency at all, so the whole chain stays
+    # finite through warmup instead of NaN.
+    return out.where(m8.notna() & s8.notna() & m2.notna() & v_adv.notna())

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+import backtest.loaders.mootdx_loader as ml
 from backtest.loaders.mootdx_loader import DataLoader, _is_a_share, _is_bj
 
 
@@ -137,6 +138,36 @@ def test_fetch_intraday_empty_window_returns_no_entry(
     assert out == {}
 
 
+def test_intraday_page_cap_rejects_incomplete_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NeverReachesStart:
+        def bars(self, symbol, frequency, start=0, offset=800):
+            del symbol, frequency, start, offset
+            timestamp = pd.Timestamp("2025-01-02 09:30")
+            return pd.DataFrame(
+                {
+                    "open": [10.0],
+                    "close": [10.0],
+                    "high": [10.0],
+                    "low": [10.0],
+                    "datetime": [timestamp],
+                    "volume": [100.0],
+                }
+            )
+
+    monkeypatch.setattr(ml, "_MAX_PAGES", 3)
+
+    with pytest.raises(ValueError, match="incomplete"):
+        DataLoader._fetch_bars_paginated(
+            NeverReachesStart(),
+            "600519",
+            8,
+            "2020-01-01",
+            "2025-01-03",
+        )
+
+
 def test_fetch_skips_non_a_share_symbols(fake_client: _FakeStdQuotes) -> None:
     loader = DataLoader()
     out = loader.fetch(["AAPL.US", "00700.HK", "BTC-USDT"], "2025-01-01", "2025-01-10")
@@ -204,6 +235,8 @@ def test_registry_lists_mootdx_in_a_share_chain() -> None:
     assert "mootdx" in LOADER_REGISTRY
     chain = FALLBACK_CHAINS["a_share"]
     assert "mootdx" in chain
-    # Order: tushare (auth) > mootdx (TCP, no auth) > akshare (HTTP scrape).
+    # Order is by IP-ban risk: throttle-tolerant public/no-auth sources lead,
+    # key-gated REST trails. So mootdx (TCP, no auth) > akshare (HTTP scrape) >
+    # tushare (key-gated REST, placed last).
     assert chain.index("mootdx") < chain.index("akshare")
-    assert chain.index("tushare") < chain.index("mootdx")
+    assert chain.index("akshare") < chain.index("tushare")
